@@ -98,6 +98,7 @@ AI_DIRS = {
 # Model subdirectories (UNDER models/)
 MODEL_DIRS = {
     "audio_models": AI_DIRS["models"] / "audio_models",
+    "base_models": AI_DIRS["models"] / "base_models",
     "checkpoints": AI_DIRS["models"] / "checkpoints",
     "controlnet": AI_DIRS["models"] / "controlnet",
     "llm": AI_DIRS["models"] / "llm",
@@ -132,7 +133,7 @@ def scan_directory(path, extensions=None):
 
 MODEL_EXTS = {".ckpt", ".safetensors", ".pt", ".pth"}
 
-base_models = scan_directory(AI_DIRS["models"], MODEL_EXTS)
+base_models = scan_directory(MODEL_DIRS["base_models"], MODEL_EXTS)
 loras = scan_directory(MODEL_DIRS["loras"], MODEL_EXTS)
 controlnets = scan_directory(MODEL_DIRS["controlnet"], MODEL_EXTS)
 checkpoints = scan_directory(MODEL_DIRS["checkpoints"], MODEL_EXTS)
@@ -203,6 +204,20 @@ def file_size_mb(path: Path) -> float:
 
 def classify_model(path: Path) -> str:
     name = path.name.lower()
+    parent_hint = "/".join(part.lower() for part in path.parts)
+
+    if "/controlnet/" in parent_hint:
+        return "controlnet"
+    if "/loras/" in parent_hint:
+        return "lora"
+    if "/llm/" in parent_hint:
+        return "llm"
+    if "/audio_models/" in parent_hint:
+        return "audio"
+    if "/base_models/" in parent_hint:
+        if "sdxl" in name or "sd_xl" in name or "sd xl" in name:
+            return "sdxl"
+        return "sd"
 
     if "controlnet" in name or "openpose" in name or "depth" in name or "normal" in name:
         return "controlnet"
@@ -220,11 +235,8 @@ def classify_model(path: Path) -> str:
         return "lora"
     if "audio" in name or "whisper" in name or "tts" in name:
         return "audio"
-    if path.suffix in {".ckpt"}:
+    if path.suffix in {".ckpt", ".safetensors"}:
         return "checkpoint"
-    if path.suffix in {".safetensors"}:
-        # Prefer treating standalone safetensors checkpoints as SD for easier loading.
-        return "sd"
     if path.suffix in {".pt", ".pth"}:
         return "checkpoint"
     if path.suffix in {".bin", ".gguf"}:
@@ -251,7 +263,8 @@ def register_models_from_dir(directory: Path):
                 )
 
 # Scan all model-related directories
-register_models_from_dir(AI_DIRS["models"])
+for directory in MODEL_DIRS.values():
+    register_models_from_dir(directory)
 
 """📊 2.5 Registry Summary"""
 
@@ -407,6 +420,12 @@ if not BASE_MODEL_OPTIONS:
 
 
 try:
+    from google.colab import output as colab_output
+    colab_output.enable_custom_widget_manager()
+except Exception:
+    pass
+
+try:
     import ipywidgets as widgets
     from IPython.display import display
 
@@ -417,10 +436,24 @@ try:
         layout=widgets.Layout(width="95%"),
         style={"description_width": "initial"},
     )
+    print("Available base models:")
+    for idx, (label, _entry) in enumerate(BASE_MODEL_OPTIONS):
+        print(f"  [{idx}] {label}")
+
     display(base_model_widget)
-    SELECTED_BASE_MODEL = base_model_widget.value
+    print("If no dropdown appears in your environment, set BASE_MODEL_INDEX manually.")
+
+    BASE_MODEL_INDEX = None  # Set to an integer index to force a model in non-widget environments.
+    if isinstance(BASE_MODEL_INDEX, int) and 0 <= BASE_MODEL_INDEX < len(BASE_MODEL_OPTIONS):
+        SELECTED_BASE_MODEL = BASE_MODEL_OPTIONS[BASE_MODEL_INDEX][1]
+        print(f"Using manual base model index: {BASE_MODEL_INDEX}")
+    else:
+        SELECTED_BASE_MODEL = base_model_widget.value
 except Exception as exc:
     print(f"⚠️ ipywidgets unavailable; falling back to automatic model selection. ({exc})")
+    print("Available base models:")
+    for idx, (label, _entry) in enumerate(BASE_MODEL_OPTIONS):
+        print(f"  [{idx}] {label}")
     SELECTED_BASE_MODEL = DEFAULT_MODELS["base_sdxl"] or DEFAULT_MODELS["base_sd"] or BASE_MODEL_OPTIONS[0][1]
 
 BASE_MODEL_PATH = require_model(SELECTED_BASE_MODEL, "Selected base model")
@@ -945,7 +978,7 @@ def smart_download_model(url: str, model_type_hint: Optional[str] = None) -> boo
     # 1. Determine the model type for routing
     model_type = model_type_hint.lower() if model_type_hint else classify_model(Path(filename))
 
-    target_dir = AI_DIRS["models"] # Default to base models directory
+    target_dir = MODEL_DIRS["base_models"] # Default to base models directory
 
     if model_type == "controlnet":
         target_dir = MODEL_DIRS["controlnet"]
@@ -957,7 +990,7 @@ def smart_download_model(url: str, model_type_hint: Optional[str] = None) -> boo
         target_dir = MODEL_DIRS["audio_models"]
     elif model_type == "checkpoint":
         target_dir = MODEL_DIRS["checkpoints"]
-    # For 'sdxl', 'sd', or 'unknown' types, it defaults to AI_DIRS["models"]
+    # For 'sdxl', 'sd', or 'unknown' types, it defaults to MODEL_DIRS['base_models']
 
     destination_path = target_dir / filename
     print(f"Deduced model type: {model_type}, Target path: {destination_path}")
@@ -975,7 +1008,8 @@ def smart_download_model(url: str, model_type_hint: Optional[str] = None) -> boo
         print("Download successful (or file already existed). Updating model registry...")
         for k in MODEL_REGISTRY:
             MODEL_REGISTRY[k].clear() # Clear all lists
-        register_models_from_dir(AI_DIRS["models"])
+        for directory in MODEL_DIRS.values():
+            register_models_from_dir(directory)
         print("Model registry updated.")
         return True
     else:

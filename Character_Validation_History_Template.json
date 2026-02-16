@@ -1,0 +1,47 @@
+{
+  "character_id": "CH-0001",
+  "created_date": "YYYY-MM-DD",
+  "baseline": {
+    "base_model": "",
+    "controlnet_stack": {
+      "pose": "",
+      "depth": "",
+      "normal": ""
+    },
+    "seed": 0,
+    "identity_embedding": {
+      "type": "",
+      "reference_images": []
+    }
+  },
+  "identity_lock": {
+    "locked_regions": ["face", "torso"],
+    "notes": ""
+  },
+  "render_sets": [
+    {
+      "set_id": "SET-0001",
+      "date": "YYYY-MM-DD",
+      "purpose": "neutral views",
+      "lighting": "",
+      "camera": "",
+      "pose_pack": "",
+      "outputs": {
+        "image_paths": []
+      },
+      "validation": {
+        "identity_invariants_pass": false,
+        "anatomy_accuracy_pass": false,
+        "notes": ""
+      }
+    }
+  ],
+  "issues": [
+    {
+      "date": "YYYY-MM-DD",
+      "issue": "",
+      "resolution": ""
+    }
+  ],
+  "next_steps": ""
+}

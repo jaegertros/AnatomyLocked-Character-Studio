@@ -311,6 +311,7 @@ except ImportError:
 """**2.8.2 Imports & Accelerator Setup**"""
 
 import torch
+import os
 from diffusers import (
     StableDiffusionXLPipeline,
     StableDiffusionXLControlNetPipeline,
@@ -370,21 +371,38 @@ print(f"Active ControlNets: {len(ACTIVE_CONTROLNETS)}")
 
 """**2.8.5 Initialize the Pipeline**"""
 
+is_single_checkpoint = os.path.isfile(BASE_SDXL_PATH)
+
 if ACTIVE_CONTROLNETS:
-    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-        BASE_SDXL_PATH,
-        controlnet=ACTIVE_CONTROLNETS,
-        torch_dtype=DTYPE,
-        safety_checker=None,
-        variant="fp16"
-    )
+    if is_single_checkpoint:
+        pipe = StableDiffusionXLControlNetPipeline.from_single_file(
+            BASE_SDXL_PATH,
+            controlnet=ACTIVE_CONTROLNETS,
+            torch_dtype=DTYPE,
+            use_safetensors=True,
+        )
+    else:
+        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+            BASE_SDXL_PATH,
+            controlnet=ACTIVE_CONTROLNETS,
+            torch_dtype=DTYPE,
+            safety_checker=None,
+            variant="fp16"
+        )
 else:
-    pipe = StableDiffusionXLPipeline.from_pretrained(
-        BASE_SDXL_PATH,
-        torch_dtype=DTYPE,
-        safety_checker=None,
-        variant="fp16"
-    )
+    if is_single_checkpoint:
+        pipe = StableDiffusionXLPipeline.from_single_file(
+            BASE_SDXL_PATH,
+            torch_dtype=DTYPE,
+            use_safetensors=True,
+        )
+    else:
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            BASE_SDXL_PATH,
+            torch_dtype=DTYPE,
+            safety_checker=None,
+            variant="fp16"
+        )
 
 pipe.to(DEVICE)
 pipe.enable_xformers_memory_efficient_attention()

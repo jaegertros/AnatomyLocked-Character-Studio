@@ -175,7 +175,7 @@ This section should rarely change.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 @dataclass
 class ModelEntry:
@@ -204,15 +204,28 @@ def file_size_mb(path: Path) -> float:
 def classify_model(path: Path) -> str:
     name = path.name.lower()
 
-    if "sdxl" in name:
-        return "sdxl"
     if "controlnet" in name or "openpose" in name or "depth" in name or "normal" in name:
         return "controlnet"
+    if "sdxl" in name or "sd_xl" in name or "sd xl" in name:
+        return "sdxl"
+    if (
+        "v1-5" in name
+        or "v15" in name
+        or "sd15" in name
+        or "stable-diffusion-v1" in name
+        or "sd-v1" in name
+    ):
+        return "sd"
     if "lora" in name or "lyco" in name:
         return "lora"
     if "audio" in name or "whisper" in name or "tts" in name:
         return "audio"
-    if path.suffix in {".ckpt", ".safetensors"}:
+    if path.suffix in {".ckpt"}:
+        return "checkpoint"
+    if path.suffix in {".safetensors"}:
+        # Prefer treating standalone safetensors checkpoints as SD for easier loading.
+        return "sd"
+    if path.suffix in {".pt", ".pth"}:
         return "checkpoint"
     if path.suffix in {".bin", ".gguf"}:
         return "llm"
@@ -271,23 +284,69 @@ preview_registry("lora")
 DEFAULT_MODELS = {
     "base_sd": None,
     "base_sdxl": None,
-    "controlnet_pose": None,
-    "controlnet_depth": None,
-    "controlnet_normal": None,
+    "sd_controlnet_pose": None,
+    "sd_controlnet_depth": None,
+    "sd_controlnet_normal": None,
+    "sdxl_controlnet_pose": None,
+    "sdxl_controlnet_depth": None,
+    "sdxl_controlnet_normal": None,
 }
 
-def select_default(model_type: str, contains: str):
+def select_default(model_type: str, contains: str, family_hint: Optional[str] = None):
     for m in MODEL_REGISTRY.get(model_type, []):
-        if contains.lower() in m.name.lower():
-            return m
+        lowered = m.name.lower()
+        if contains.lower() not in lowered:
+            continue
+        if family_hint == "sdxl" and "sdxl" not in lowered:
+            continue
+        if family_hint == "sd" and "sdxl" in lowered:
+            continue
+        return m
     return None
 
 """Example defaults (adjust names as needed)"""
 
 DEFAULT_MODELS["base_sdxl"] = select_default("sdxl", "base")
-DEFAULT_MODELS["controlnet_pose"] = select_default("controlnet", "openpose")
-DEFAULT_MODELS["controlnet_depth"] = select_default("controlnet", "depth")
-DEFAULT_MODELS["controlnet_normal"] = select_default("controlnet", "normal")
+DEFAULT_MODELS["base_sd"] = select_default("sd", "v1-5") or select_default("sd", "sd15")
+
+DEFAULT_MODELS["sdxl_controlnet_pose"] = select_default("controlnet", "openpose", "sdxl")
+DEFAULT_MODELS["sdxl_controlnet_depth"] = select_default("controlnet", "depth", "sdxl")
+DEFAULT_MODELS["sdxl_controlnet_normal"] = select_default("controlnet", "normal", "sdxl")
+
+DEFAULT_MODELS["sd_controlnet_pose"] = select_default("controlnet", "openpose", "sd")
+DEFAULT_MODELS["sd_controlnet_depth"] = select_default("controlnet", "depth", "sd")
+DEFAULT_MODELS["sd_controlnet_normal"] = select_default("controlnet", "normal", "sd")
+
+
+def infer_base_family(model_entry: Optional[ModelEntry]) -> Optional[str]:
+    if model_entry is None:
+        return None
+
+    lowered = model_entry.name.lower()
+    if "sdxl" in lowered or "sd_xl" in lowered or "sd xl" in lowered:
+        return "sdxl"
+    return "sd"
+
+
+ACTIVE_BASE_FAMILY = "sdxl" if DEFAULT_MODELS["base_sdxl"] else "sd" if DEFAULT_MODELS["base_sd"] else None
+
+
+def get_controlnet_defaults_for_family(family: Optional[str]) -> Dict[str, Optional[ModelEntry]]:
+    if family == "sdxl":
+        return {
+            "pose": DEFAULT_MODELS["sdxl_controlnet_pose"],
+            "depth": DEFAULT_MODELS["sdxl_controlnet_depth"],
+            "normal": DEFAULT_MODELS["sdxl_controlnet_normal"],
+        }
+
+    return {
+        "pose": DEFAULT_MODELS["sd_controlnet_pose"],
+        "depth": DEFAULT_MODELS["sd_controlnet_depth"],
+        "normal": DEFAULT_MODELS["sd_controlnet_normal"],
+    }
+
+
+ACTIVE_CONTROLNET_DEFAULTS = get_controlnet_defaults_for_family(ACTIVE_BASE_FAMILY)
 
 print("⭐ Default Model Selection\n")
 for k, v in DEFAULT_MODELS.items():
@@ -313,6 +372,8 @@ except ImportError:
 import torch
 import os
 from diffusers import (
+    StableDiffusionPipeline,
+    StableDiffusionControlNetPipeline,
     StableDiffusionXLPipeline,
     StableDiffusionXLControlNetPipeline,
     ControlNetModel
@@ -331,10 +392,45 @@ def require_model(entry, label):
         raise RuntimeError(f"Required model missing: {label}")
     return entry.path
 
-BASE_SDXL_PATH = require_model(
-    DEFAULT_MODELS["base_sdxl"],
-    "Base SDXL model"
-)
+def build_base_model_options() -> List[tuple[str, ModelEntry]]:
+    options: List[tuple[str, ModelEntry]] = []
+    for model_type in ("sd", "sdxl"):
+        for entry in MODEL_REGISTRY.get(model_type, []):
+            label = f"{model_type.upper()} • {entry.name} ({entry.size_mb} MB)"
+            options.append((label, entry))
+    return options
+
+
+BASE_MODEL_OPTIONS = build_base_model_options()
+if not BASE_MODEL_OPTIONS:
+    raise RuntimeError("No base SD/SDXL models were found in the model registry.")
+
+
+try:
+    import ipywidgets as widgets
+    from IPython.display import display
+
+    base_model_widget = widgets.Dropdown(
+        options=BASE_MODEL_OPTIONS,
+        value=(DEFAULT_MODELS["base_sdxl"] or DEFAULT_MODELS["base_sd"] or BASE_MODEL_OPTIONS[0][1]),
+        description="Base Model:",
+        layout=widgets.Layout(width="95%"),
+        style={"description_width": "initial"},
+    )
+    display(base_model_widget)
+    SELECTED_BASE_MODEL = base_model_widget.value
+except Exception as exc:
+    print(f"⚠️ ipywidgets unavailable; falling back to automatic model selection. ({exc})")
+    SELECTED_BASE_MODEL = DEFAULT_MODELS["base_sdxl"] or DEFAULT_MODELS["base_sd"] or BASE_MODEL_OPTIONS[0][1]
+
+BASE_MODEL_PATH = require_model(SELECTED_BASE_MODEL, "Selected base model")
+BASE_MODEL_FAMILY = infer_base_family(SELECTED_BASE_MODEL)
+SELECTED_CONTROLNET_MODELS = get_controlnet_defaults_for_family(BASE_MODEL_FAMILY)
+
+print(f"Selected base model: {SELECTED_BASE_MODEL.name}")
+print(f"Detected base family: {BASE_MODEL_FAMILY}")
+for c_key, c_entry in SELECTED_CONTROLNET_MODELS.items():
+    print(f"ControlNet {c_key:6s}: {c_entry.name if c_entry else 'None'}")
 
 """**2.8.4 Load ControlNet Models (If Available)**"""
 
@@ -353,17 +449,17 @@ def load_controlnet(key, model_entry):
 
 CONTROLNETS["pose"] = load_controlnet(
     "pose",
-    DEFAULT_MODELS["controlnet_pose"]
+    SELECTED_CONTROLNET_MODELS["pose"]
 )
 
 CONTROLNETS["depth"] = load_controlnet(
     "depth",
-    DEFAULT_MODELS["controlnet_depth"]
+    SELECTED_CONTROLNET_MODELS["depth"]
 )
 
 CONTROLNETS["normal"] = load_controlnet(
     "normal",
-    DEFAULT_MODELS["controlnet_normal"]
+    SELECTED_CONTROLNET_MODELS["normal"]
 )
 
 ACTIVE_CONTROLNETS = [cn for cn in CONTROLNETS.values() if cn is not None]
@@ -371,42 +467,95 @@ print(f"Active ControlNets: {len(ACTIVE_CONTROLNETS)}")
 
 """**2.8.5 Initialize the Pipeline**"""
 
-is_single_checkpoint = os.path.isfile(BASE_SDXL_PATH)
+is_single_checkpoint = os.path.isfile(BASE_MODEL_PATH)
 
-if ACTIVE_CONTROLNETS:
-    if is_single_checkpoint:
-        pipe = StableDiffusionXLControlNetPipeline.from_single_file(
-            BASE_SDXL_PATH,
-            controlnet=ACTIVE_CONTROLNETS,
-            torch_dtype=DTYPE,
-            use_safetensors=True,
-        )
+if BASE_MODEL_FAMILY == "sdxl":
+    if ACTIVE_CONTROLNETS:
+        if is_single_checkpoint:
+            pipe = StableDiffusionXLControlNetPipeline.from_single_file(
+                BASE_MODEL_PATH,
+                controlnet=ACTIVE_CONTROLNETS,
+                torch_dtype=DTYPE,
+                use_safetensors=True,
+            )
+        else:
+            pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+                BASE_MODEL_PATH,
+                controlnet=ACTIVE_CONTROLNETS,
+                torch_dtype=DTYPE,
+                safety_checker=None,
+                variant="fp16"
+            )
     else:
-        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-            BASE_SDXL_PATH,
-            controlnet=ACTIVE_CONTROLNETS,
-            torch_dtype=DTYPE,
-            safety_checker=None,
-            variant="fp16"
-        )
+        if is_single_checkpoint:
+            pipe = StableDiffusionXLPipeline.from_single_file(
+                BASE_MODEL_PATH,
+                torch_dtype=DTYPE,
+                use_safetensors=True,
+            )
+        else:
+            pipe = StableDiffusionXLPipeline.from_pretrained(
+                BASE_MODEL_PATH,
+                torch_dtype=DTYPE,
+                safety_checker=None,
+                variant="fp16"
+            )
 else:
-    if is_single_checkpoint:
-        pipe = StableDiffusionXLPipeline.from_single_file(
-            BASE_SDXL_PATH,
+    if ACTIVE_CONTROLNETS:
+        pipe = StableDiffusionControlNetPipeline.from_single_file(
+            BASE_MODEL_PATH,
+            controlnet=ACTIVE_CONTROLNETS,
             torch_dtype=DTYPE,
             use_safetensors=True,
         )
     else:
-        pipe = StableDiffusionXLPipeline.from_pretrained(
-            BASE_SDXL_PATH,
+        pipe = StableDiffusionPipeline.from_single_file(
+            BASE_MODEL_PATH,
             torch_dtype=DTYPE,
-            safety_checker=None,
-            variant="fp16"
+            use_safetensors=True,
         )
 
 pipe.to(DEVICE)
-pipe.enable_xformers_memory_efficient_attention()
-pipe.enable_model_cpu_offload()
+
+try:
+    pipe.enable_xformers_memory_efficient_attention()
+    print("✅ xFormers attention enabled.")
+except ModuleNotFoundError:
+    print("⚠️ xformers is not installed; running without memory-efficient attention.")
+except Exception as exc:
+    print(f"⚠️ Could not enable xformers attention: {exc}")
+
+try:
+    pipe.enable_model_cpu_offload()
+except Exception as exc:
+    print(f"⚠️ CPU offload could not be enabled: {exc}")
+
+
+def print_runtime_package_versions():
+    """Print versions for core diffusion/runtime packages in the current environment."""
+    import importlib
+
+    packages = [
+        "torch",
+        "torchvision",
+        "xformers",
+        "transformers",
+        "diffusers",
+        "accelerate",
+        "bitsandbytes",
+    ]
+
+    for package_name in packages:
+        try:
+            module = importlib.import_module(package_name)
+            version = getattr(module, "__version__", "unknown")
+            print(f"{package_name:14s}: {version}")
+        except ModuleNotFoundError:
+            print(f"{package_name:14s}: not installed")
+
+
+print("\nRuntime package versions:")
+print_runtime_package_versions()
 
 """**2.8.6 Deterministic Seeding (Critical for Identity Work)**"""
 

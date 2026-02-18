@@ -689,8 +689,7 @@ def preflight_checks(base_model_entry=None, use_controlnet=False, controlnet_ent
             )
 
     if errors:
-        print("Preflight checks failed:
-")
+        print("Preflight checks failed:\n")
         for err in errors:
             print(f" - {err}")
         raise RuntimeError("Preflight checks failed. See messages above.")
@@ -945,7 +944,7 @@ warn_controlnet_compatibility(
 
 # Runtime configuration
 # Set USE_CONTROLNET = True only after a successful base render.
-USE_CONTROLNET = False
+USE_CONTROLNET = True
 
 # Default output size for SDXL without ControlNet
 OUTPUT_WIDTH = 768
@@ -966,6 +965,114 @@ CONTROLNET_CONDITIONING_SCALES = {
     "depth": 0.8,
     "normal": 0.8,
 }
+
+
+def get_repo_root():
+    from pathlib import Path
+
+    markers = {
+        "AnatomyLocked_Character_Studio.ipynb",
+        "anatomylocked_character_studio.py",
+        ".git",
+    }
+    cwd = Path.cwd()
+    for parent in (cwd, *cwd.parents):
+        if any((parent / marker).exists() for marker in markers):
+            return parent
+    return cwd
+
+
+DEFAULT_CONTROLNET_IMAGE_PATHS = {
+    "pose": get_repo_root() / "assets" / "controlnet" / "pose.png",
+    "depth": get_repo_root() / "assets" / "controlnet" / "depth.png",
+    "normal": get_repo_root() / "assets" / "controlnet" / "normal.png",
+}
+
+if "CONTROLNET_IMAGE_PATHS" not in globals():
+    CONTROLNET_IMAGE_PATHS = DEFAULT_CONTROLNET_IMAGE_PATHS.copy()
+
+
+def make_controlnet_fallback_image(kind: str, width: int, height: int):
+    from PIL import Image, ImageDraw
+
+    kind = (kind or "").lower()
+
+    if kind == "pose":
+        canvas = Image.new("RGB", (width, height), (245, 245, 245))
+        draw = ImageDraw.Draw(canvas)
+
+        cx = width // 2
+        head_r = width // 15
+        shoulder_y = int(height * 0.24)
+        hip_y = int(height * 0.50)
+        knee_y = int(height * 0.72)
+        foot_y = int(height * 0.92)
+
+        draw.ellipse(
+            (cx - head_r, shoulder_y - 2 * head_r, cx + head_r, shoulder_y),
+            outline=(20, 20, 20),
+            width=12,
+        )
+        draw.line((cx, shoulder_y, cx, hip_y), fill=(20, 20, 20), width=14)
+
+        arm_span = width // 5
+        elbow_drop = height // 10
+        hand_drop = height // 7
+        draw.line((cx, shoulder_y, cx - arm_span, shoulder_y + elbow_drop), fill=(20, 20, 20), width=12)
+        draw.line(
+            (cx - arm_span, shoulder_y + elbow_drop, cx - int(arm_span * 0.6), shoulder_y + hand_drop),
+            fill=(20, 20, 20),
+            width=10,
+        )
+        draw.line((cx, shoulder_y, cx + arm_span, shoulder_y + elbow_drop), fill=(20, 20, 20), width=12)
+        draw.line(
+            (cx + arm_span, shoulder_y + elbow_drop, cx + int(arm_span * 0.6), shoulder_y + hand_drop),
+            fill=(20, 20, 20),
+            width=10,
+        )
+
+        leg_span = width // 10
+        draw.line((cx, hip_y, cx - leg_span, knee_y), fill=(20, 20, 20), width=13)
+        draw.line(
+            (cx - leg_span, knee_y, cx - int(leg_span * 1.3), foot_y),
+            fill=(20, 20, 20),
+            width=11,
+        )
+        draw.line((cx, hip_y, cx + leg_span, knee_y), fill=(20, 20, 20), width=13)
+        draw.line(
+            (cx + leg_span, knee_y, cx + int(leg_span * 1.3), foot_y),
+            fill=(20, 20, 20),
+            width=11,
+        )
+
+        return canvas
+
+    if kind == "depth":
+        depth = Image.new("RGB", (width, height))
+        draw = ImageDraw.Draw(depth)
+        for y in range(height):
+            val = int(255 * (1 - y / (height - 1)))
+            draw.line([(0, y), (width, y)], fill=(val, val, val))
+        return depth
+
+    if kind == "normal":
+        normal = Image.new("RGB", (width, height))
+        draw = ImageDraw.Draw(normal)
+        for y in range(height):
+            b = 255 - int(40 * (y / (height - 1)))
+            draw.line([(0, y), (width, y)], fill=(128, 128, b))
+        return normal
+
+    return Image.new("RGB", (width, height), (128, 128, 128))
+
+
+# ControlNet pose-set library
+CONTROLNET_LIBRARY_DIR = AI_DIRS["images"] / "controlnet_sets"
+CONTROLNET_SET_NAME = ""  # Optional: select a saved pose set name
+CONTROLNET_SOURCE_IMAGE_PATH = ""  # Optional: path to a base image to import
+CONTROLNET_AUTO_GENERATE_MAPS = True
+CONTROLNET_OVERWRITE_EXISTING = False
+
 
 """# **🔹 SECTION 2.8 — Diffusers Pipeline Initialization (Registry-Driven)**"""
 
@@ -1252,7 +1359,7 @@ try:
     print("xformers is already installed.")
 except ImportError:
     print("xformers not found, installing...")
-    !pip install -q xformers
+    !pip install -q xformers==0.0.32.post2
     print("xformers installation complete.")
 
 """**2.8.6 Deterministic Seeding (Critical for Identity Work)**"""
@@ -1272,19 +1379,65 @@ def set_seed(seed: int):
 set_seed(12345)
 
 prompt = (
-    "neutral anatomical reference photograph of an adult human, "
+    "neutral anatomical reference photograph of a nude female in her mid 20s, "
     "standing relaxed, evenly lit, realistic proportions"
 )
 
-image = pipe(
-    prompt=prompt,
-    num_inference_steps=30,
-    guidance_scale=5.5,
-    width=OUTPUT_WIDTH,
-    height=OUTPUT_HEIGHT,
-).images[0]
+call_kwargs = {
+    "prompt": prompt,
+    "num_inference_steps": 30,
+    "guidance_scale": 5.5,
+}
+
+if ACTIVE_CONTROLNETS:
+    controlnet_key_order = [
+        key for key in ("pose", "depth", "normal") if CONTROLNETS.get(key) is not None
+    ]
+
+    if not controlnet_key_order:
+        print("Active ControlNets found but none are mapped; running without ControlNet images.")
+        call_kwargs["width"] = OUTPUT_WIDTH
+        call_kwargs["height"] = OUTPUT_HEIGHT
+    else:
+        controlnet_images = []
+        for key in controlnet_key_order:
+            image_path = (
+                CONTROLNET_IMAGE_PATHS.get(key)
+                if isinstance(CONTROLNET_IMAGE_PATHS, dict)
+                else None
+            )
+            img = None
+            if image_path:
+                try:
+                    img = load_image(str(image_path))
+                except Exception as exc:
+                    print(f"ControlNet image load failed for {key}: {exc}")
+            if img is None:
+                img = make_controlnet_fallback_image(key, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+            controlnet_images.append(img)
+
+        call_kwargs["image"] = (
+            controlnet_images[0]
+            if len(controlnet_images) == 1
+            else controlnet_images
+        )
+        call_kwargs["width"], call_kwargs["height"] = controlnet_images[0].size
+
+        scales = [
+            CONTROLNET_CONDITIONING_SCALES.get(key, 1.0)
+            for key in controlnet_key_order
+        ]
+        call_kwargs["controlnet_conditioning_scale"] = (
+            scales[0] if len(scales) == 1 else scales
+        )
+else:
+    call_kwargs["width"] = OUTPUT_WIDTH
+    call_kwargs["height"] = OUTPUT_HEIGHT
+
+image = pipe(**call_kwargs).images[0]
 
 display(image)
+
 
 """---
 
@@ -1318,7 +1471,7 @@ if ACTIVE_CONTROLNETS:
 else:
     set_seed(20240217)
     quick_prompt = (
-        "neutral anatomical reference photograph of an adult human, "
+        "neutral anatomical reference photograph color of an adult nude asian teenage female front view, "
         "standing relaxed, evenly lit, realistic proportions"
     )
     quick_negative = "stylized, cartoon, deformed, extra limbs, low quality, blurry, lowres"
@@ -1377,6 +1530,252 @@ def _run_clicked(_):
 
 run_button.on_click(_run_clicked)
 display(widgets.VBox([prompt_additions_text, negative_additions_text, run_button, run_output]))
+
+# ControlNet pose-set library utilities
+from datetime import datetime
+from pathlib import Path
+import json
+
+from PIL import Image
+
+
+def list_controlnet_sets(root: Path) -> list[str]:
+    if not root.exists():
+        return []
+    names = []
+    for p in root.iterdir():
+        if p.is_dir() and ((p / "source.png").exists() or (p / "meta.json").exists()):
+            names.append(p.name)
+    return sorted(names)
+
+
+def _normalize_set_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        return ""
+    for ch in ["/", "\", ":", "|"]:
+        name = name.replace(ch, "_")
+    return name
+
+
+def _runtime_versions_for_meta():
+    getter = globals().get("get_runtime_versions")
+    if callable(getter):
+        try:
+            return getter()
+        except Exception:
+            return {}
+    versions = {}
+    try:
+        import controlnet_aux
+        versions["controlnet_aux"] = getattr(controlnet_aux, "__version__", "unknown")
+    except Exception:
+        pass
+    try:
+        import torch
+        versions["torch"] = getattr(torch, "__version__", "unknown")
+    except Exception:
+        pass
+    return versions
+
+
+def save_controlnet_set(root: Path, name: str, source: Image.Image, maps: dict, source_path_original: str | None = None,
+                        overwrite: bool = False) -> dict:
+    root.mkdir(parents=True, exist_ok=True)
+    name = _normalize_set_name(name)
+    if not name:
+        raise ValueError("Set name must not be empty.")
+    set_dir = root / name
+    set_dir.mkdir(parents=True, exist_ok=True)
+
+    def maybe_save(img: Image.Image, path: Path) -> bool:
+        if path.exists() and not overwrite:
+            return False
+        img.save(path)
+        return True
+
+    maybe_save(source, set_dir / "source.png")
+    for key, img in maps.items():
+        if img is None:
+            continue
+        maybe_save(img, set_dir / f"{key}.png")
+
+    meta_path = set_dir / "meta.json"
+    existing = {}
+    if meta_path.exists():
+        try:
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+
+    meta = {
+        "created_at": existing.get("created_at") or datetime.utcnow().isoformat() + "Z",
+        "source_path_original": source_path_original or existing.get("source_path_original"),
+        "size": list(source.size),
+        "generator_versions": _runtime_versions_for_meta(),
+        "maps_present": {
+            "pose": (set_dir / "pose.png").exists(),
+            "depth": (set_dir / "depth.png").exists(),
+            "normal": (set_dir / "normal.png").exists(),
+        },
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return meta
+
+
+def load_controlnet_set(root: Path, name: str, auto_generate: bool = True, overwrite: bool = False):
+    name = _normalize_set_name(name)
+    set_dir = root / name
+    if not set_dir.exists():
+        raise FileNotFoundError(f"ControlNet set not found: {set_dir}")
+    source_path = set_dir / "source.png"
+    if not source_path.exists():
+        raise FileNotFoundError(f"Missing source image: {source_path}")
+    source = Image.open(source_path).convert("RGB")
+
+    maps = {}
+    missing = []
+    for key in ["pose", "depth", "normal"]:
+        p = set_dir / f"{key}.png"
+        if p.exists():
+            maps[key] = Image.open(p).convert("RGB")
+        else:
+            missing.append(key)
+
+    if missing and auto_generate:
+        ensure_controlnet_aux_installed()
+        generated = generate_controlnet_conditioning_maps(source)
+        for key in missing:
+            maps[key] = generated.get(key)
+        save_controlnet_set(root, name, source, maps, overwrite=overwrite)
+
+    return source, maps, set_dir
+
+
+def _resize_to_match(img: Image.Image, size: tuple[int, int]) -> Image.Image:
+    if img.size == size:
+        return img
+    return img.resize(size, resample=Image.BICUBIC)
+
+
+def resolve_controlnet_conditioning(
+    library_dir: Path,
+    set_name: str,
+    source_image_path: str,
+    auto_generate: bool,
+    overwrite_existing: bool,
+    default_width: int,
+    default_height: int,
+):
+    library_dir.mkdir(parents=True, exist_ok=True)
+    selected_name = _normalize_set_name(set_name)
+    source_image = None
+    conditioning_by_key = {}
+    active_keys = []
+
+    if selected_name:
+        source_image, conditioning_by_key, _ = load_controlnet_set(
+            library_dir, selected_name, auto_generate=auto_generate, overwrite=overwrite_existing
+        )
+    elif source_image_path:
+        src_path = Path(source_image_path)
+        if not src_path.exists():
+            raise FileNotFoundError(f"Source image not found: {src_path}")
+        source_image = Image.open(src_path).convert("RGB")
+        if not selected_name:
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            selected_name = _normalize_set_name(src_path.stem + "_" + ts)
+        if auto_generate:
+            ensure_controlnet_aux_installed()
+            conditioning_by_key = generate_controlnet_conditioning_maps(source_image)
+        save_controlnet_set(
+            library_dir, selected_name, source_image, conditioning_by_key,
+            source_path_original=str(src_path), overwrite=overwrite_existing,
+        )
+    else:
+        source_image = make_sample_pose_image(width=default_width, height=default_height)
+        selected_name = ""
+        if auto_generate:
+            ensure_controlnet_aux_installed()
+            conditioning_by_key = generate_controlnet_conditioning_maps(source_image)
+
+    if source_image is not None and conditioning_by_key:
+        size = source_image.size
+        for k, img in list(conditioning_by_key.items()):
+            if img is None:
+                conditioning_by_key.pop(k, None)
+                continue
+            conditioning_by_key[k] = _resize_to_match(img, size)
+
+    if "CONTROLNETS" in globals():
+        active_keys = [k for k, m in CONTROLNETS.items() if m is not None and k in conditioning_by_key]
+
+    return source_image, conditioning_by_key, active_keys, selected_name
+
+# ControlNet pose-set selection UI
+try:
+    import ipywidgets as widgets
+    from IPython.display import display
+
+    CONTROLNET_LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    _set_names = [""] + list_controlnet_sets(CONTROLNET_LIBRARY_DIR)
+    _dropdown = widgets.Dropdown(
+        options=_set_names,
+        value=CONTROLNET_SET_NAME or "",
+        description="Pose set",
+    )
+    _text = widgets.Text(
+        value=CONTROLNET_SET_NAME or "",
+        description="Set name",
+    )
+
+    def _on_dropdown(change):
+        global CONTROLNET_SET_NAME
+        if change.get("name") == "value":
+            CONTROLNET_SET_NAME = change.get("new") or ""
+            _text.value = CONTROLNET_SET_NAME
+
+    def _on_text(change):
+        global CONTROLNET_SET_NAME
+        if change.get("name") == "value":
+            CONTROLNET_SET_NAME = change.get("new") or ""
+
+    _dropdown.observe(_on_dropdown, names="value")
+    _text.observe(_on_text, names="value")
+
+    display(_dropdown, _text)
+except Exception:
+    print("ipywidgets not available; set CONTROLNET_SET_NAME manually.")
+
+# Create a ControlNet pose set from a base image
+# 1) Set CONTROLNET_SOURCE_IMAGE_PATH to the base image file
+# 2) Optionally set CONTROLNET_SET_NAME (defaults to filename + timestamp)
+# 3) Run this cell to generate pose/depth/normal maps and save the set
+
+if CONTROLNET_SOURCE_IMAGE_PATH:
+    src_path = Path(CONTROLNET_SOURCE_IMAGE_PATH)
+    if not src_path.exists():
+        raise FileNotFoundError(f"Source image not found: {src_path}")
+
+    set_name = _normalize_set_name(CONTROLNET_SET_NAME)
+    if not set_name:
+        set_name = _normalize_set_name(src_path.stem + "_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S"))
+
+    ensure_controlnet_aux_installed()
+    source_image = Image.open(src_path).convert("RGB")
+    maps = generate_controlnet_conditioning_maps(source_image) if CONTROLNET_AUTO_GENERATE_MAPS else {}
+
+    save_controlnet_set(
+        CONTROLNET_LIBRARY_DIR,
+        set_name,
+        source_image,
+        maps,
+        source_path_original=str(src_path),
+        overwrite=CONTROLNET_OVERWRITE_EXISTING,
+    )
+    print(f"Saved ControlNet set: {set_name} -> {CONTROLNET_LIBRARY_DIR / set_name}")
+else:
+    print("Set CONTROLNET_SOURCE_IMAGE_PATH to a base image, optionally CONTROLNET_SET_NAME.")
 
 from datetime import datetime
 from pathlib import Path
@@ -1455,28 +1854,35 @@ conditioning_by_key = {}
 active_controlnet_keys = []
 source_image = None
 source_path = None
+controlnet_set_name = ""
 
 if USE_CONTROLNET:
-    ensure_controlnet_aux_installed()
-    source_image = make_sample_pose_image(width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT)
-    source_path = EXPLORATION_DIR / "controlnet_source_pose.png"
-    source_image.save(source_path)
-    print(f"Saved source pose image: {source_path}")
+    source_image, conditioning_by_key, active_controlnet_keys, controlnet_set_name = resolve_controlnet_conditioning(
+        CONTROLNET_LIBRARY_DIR,
+        CONTROLNET_SET_NAME,
+        CONTROLNET_SOURCE_IMAGE_PATH,
+        CONTROLNET_AUTO_GENERATE_MAPS,
+        CONTROLNET_OVERWRITE_EXISTING,
+        OUTPUT_WIDTH,
+        OUTPUT_HEIGHT,
+    )
 
-    conditioning_by_key = generate_controlnet_conditioning_maps(source_image)
+    if source_image is not None:
+        source_path = EXPLORATION_DIR / "controlnet_source_pose.png"
+        source_image.save(source_path)
+        print(f"Saved source pose image: {source_path}")
+
     for key, cond_image in conditioning_by_key.items():
         cond_path = EXPLORATION_DIR / f"conditioning_{key}.png"
         cond_image.save(cond_path)
         print(f"Saved conditioning map ({key}): {cond_path}")
 
-    active_controlnet_keys = [key for key, model in CONTROLNETS.items() if model is not None]
     if active_controlnet_keys:
         print(f"Using ControlNet conditioning maps for: {', '.join(active_controlnet_keys)}")
     else:
         print("No active ControlNets found; exploration will run without ControlNet conditioning.")
 else:
     print("USE_CONTROLNET is False. Exploration will run without ControlNet.")
-
 base_prompt = (
     "neutral anatomical reference photograph of an adult human, "
     "standing relaxed, evenly lit, realistic proportions"
@@ -1554,6 +1960,9 @@ meta = {
     "controlnet_keys": list(active_controlnet_keys),
     "controlnet_conditioning_scales": scales,
     "controlnet_source": str(source_path) if source_path else None,
+    "controlnet_set_name": controlnet_set_name or None,
+    "controlnet_library_dir": str(CONTROLNET_LIBRARY_DIR) if "CONTROLNET_LIBRARY_DIR" in globals() else None,
+    "controlnet_source_path": CONTROLNET_SOURCE_IMAGE_PATH or None,
 }
 
 meta_path = EXPLORATION_DIR / "generation_meta.json"
@@ -1802,7 +2211,8 @@ else:
         metadata=candidate_metadata,
     )
 
-"""---
+"""
+---
 
 # SECTION 5 — Identity Locking & Invariant Feature Definition
 

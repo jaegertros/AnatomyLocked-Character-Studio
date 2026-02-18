@@ -1180,23 +1180,111 @@ except Exception as exc:
 BASE_MODEL_PATH = require_model(SELECTED_BASE_MODEL, "Selected base model")
 BASE_MODEL_FAMILY = infer_base_family(SELECTED_BASE_MODEL)
 
+
+def build_controlnet_options(family: str | None):
+    options = [("None", None)]
+    for entry in MODEL_REGISTRY.get("controlnet", []):
+        if family:
+            m_family = _detect_family_from_entry(entry)
+            if m_family != family:
+                continue
+        label = f"{entry.name} ({entry.size_mb} MB)"
+        options.append((label, entry))
+    return options
+
+
+CONTROLNET_OPTIONS = build_controlnet_options(BASE_MODEL_FAMILY)
+
+
+def _default_controlnet_entry(entry):
+    values = [opt[1] for opt in CONTROLNET_OPTIONS]
+    return entry if entry in values else None
+
+
 if BASE_MODEL_FAMILY == "sdxl":
-    SELECTED_CONTROLNET_MODELS = {
-        "pose": DEFAULT_MODELS["sdxl_controlnet_pose"],
-        "depth": DEFAULT_MODELS["sdxl_controlnet_depth"],
-        "normal": DEFAULT_MODELS["sdxl_controlnet_normal"],
-    }
+    default_pose = _default_controlnet_entry(DEFAULT_MODELS["sdxl_controlnet_pose"])
+    default_depth = _default_controlnet_entry(DEFAULT_MODELS["sdxl_controlnet_depth"])
+    default_normal = _default_controlnet_entry(DEFAULT_MODELS["sdxl_controlnet_normal"])
 else:
+    default_pose = _default_controlnet_entry(DEFAULT_MODELS["sd_controlnet_pose"])
+    default_depth = _default_controlnet_entry(DEFAULT_MODELS["sd_controlnet_depth"])
+    default_normal = _default_controlnet_entry(DEFAULT_MODELS["sd_controlnet_normal"])
+
+try:
+    import ipywidgets as widgets
+    from IPython.display import display
+
+    print("Available ControlNet models (filtered by base family):")
+    for idx, (label, _entry) in enumerate(CONTROLNET_OPTIONS):
+        print(f"  [{idx}] {label}")
+
+    controlnet_pose_widget = widgets.Dropdown(
+        options=CONTROLNET_OPTIONS,
+        value=default_pose,
+        description="ControlNet Pose:",
+        layout=widgets.Layout(width="95%"),
+        style={"description_width": "initial"},
+    )
+    controlnet_depth_widget = widgets.Dropdown(
+        options=CONTROLNET_OPTIONS,
+        value=default_depth,
+        description="ControlNet Depth:",
+        layout=widgets.Layout(width="95%"),
+        style={"description_width": "initial"},
+    )
+    controlnet_normal_widget = widgets.Dropdown(
+        options=CONTROLNET_OPTIONS,
+        value=default_normal,
+        description="ControlNet Normal:",
+        layout=widgets.Layout(width="95%"),
+        style={"description_width": "initial"},
+    )
+
+    display(widgets.VBox([controlnet_pose_widget, controlnet_depth_widget, controlnet_normal_widget]))
+    print("If no dropdown appears, set CONTROLNET_*_INDEX manually and re-run this cell.")
+    print("Re-run this cell after changing the base model to refresh ControlNet options.")
+
+    CONTROLNET_POSE_INDEX = None
+    CONTROLNET_DEPTH_INDEX = None
+    CONTROLNET_NORMAL_INDEX = None
+
+    def _resolve_controlnet_index(index, widget):
+        if isinstance(index, int) and 0 <= index < len(CONTROLNET_OPTIONS):
+            return CONTROLNET_OPTIONS[index][1], True
+        return widget.value, False
+
+    pose_entry, _pose_manual = _resolve_controlnet_index(CONTROLNET_POSE_INDEX, controlnet_pose_widget)
+    depth_entry, _depth_manual = _resolve_controlnet_index(CONTROLNET_DEPTH_INDEX, controlnet_depth_widget)
+    normal_entry, _normal_manual = _resolve_controlnet_index(CONTROLNET_NORMAL_INDEX, controlnet_normal_widget)
+
     SELECTED_CONTROLNET_MODELS = {
-        "pose": DEFAULT_MODELS["sd_controlnet_pose"],
-        "depth": DEFAULT_MODELS["sd_controlnet_depth"],
-        "normal": DEFAULT_MODELS["sd_controlnet_normal"],
+        "pose": pose_entry,
+        "depth": depth_entry,
+        "normal": normal_entry,
+    }
+except Exception as exc:
+    print(f"⚠️ ipywidgets unavailable; falling back to default ControlNet selection. ({exc})")
+    SELECTED_CONTROLNET_MODELS = {
+        "pose": default_pose,
+        "depth": default_depth,
+        "normal": default_normal,
     }
 
 print(f"Selected base model: {SELECTED_BASE_MODEL.name}")
 print(f"Detected base family: {BASE_MODEL_FAMILY}")
 for c_key, c_entry in SELECTED_CONTROLNET_MODELS.items():
     print(f"ControlNet {c_key:6s}: {c_entry.name if c_entry else 'None'}")
+
+active_controlnet_keys = [k for k, v in SELECTED_CONTROLNET_MODELS.items() if v is not None]
+if not active_controlnet_keys:
+    print("ControlNet mode: none (base model only)")
+elif len(active_controlnet_keys) == 1:
+    print(f"ControlNet mode: single ({active_controlnet_keys[0]})")
+else:
+    print(f"ControlNet mode: multi ({', '.join(active_controlnet_keys)})")
+
+if "USE_CONTROLNET" in globals() and not USE_CONTROLNET and active_controlnet_keys:
+    print("Note: USE_CONTROLNET is False, so ControlNet selections will be ignored.")
 
 preflight_checks(SELECTED_BASE_MODEL, USE_CONTROLNET, SELECTED_CONTROLNET_MODELS)
 
@@ -1267,19 +1355,23 @@ print(f"Active ControlNets: {len(ACTIVE_CONTROLNETS)}")
 
 is_single_checkpoint = os.path.isfile(BASE_MODEL_PATH)
 
+controlnet_arg = None
+if ACTIVE_CONTROLNETS:
+    controlnet_arg = ACTIVE_CONTROLNETS[0] if len(ACTIVE_CONTROLNETS) == 1 else ACTIVE_CONTROLNETS
+
 if BASE_MODEL_FAMILY == "sdxl":
     if ACTIVE_CONTROLNETS:
         if is_single_checkpoint:
             pipe = StableDiffusionXLControlNetPipeline.from_single_file(
                 BASE_MODEL_PATH,
-                controlnet=ACTIVE_CONTROLNETS,
+                controlnet=controlnet_arg,
                 torch_dtype=DTYPE,
                 use_safetensors=True,
             )
         else:
             pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
                 BASE_MODEL_PATH,
-                controlnet=ACTIVE_CONTROLNETS,
+                controlnet=controlnet_arg,
                 torch_dtype=DTYPE,
                 safety_checker=None,
                 variant="fp16"
@@ -1302,7 +1394,7 @@ else:
     if ACTIVE_CONTROLNETS:
         pipe = StableDiffusionControlNetPipeline.from_single_file(
             BASE_MODEL_PATH,
-            controlnet=ACTIVE_CONTROLNETS,
+            controlnet=controlnet_arg,
             torch_dtype=DTYPE,
             use_safetensors=True,
         )
@@ -1390,9 +1482,7 @@ call_kwargs = {
 }
 
 if ACTIVE_CONTROLNETS:
-    controlnet_key_order = [
-        key for key in ("pose", "depth", "normal") if CONTROLNETS.get(key) is not None
-    ]
+    controlnet_key_order = [key for key, model in CONTROLNETS.items() if model is not None]
 
     if not controlnet_key_order:
         print("Active ControlNets found but none are mapped; running without ControlNet images.")
@@ -1416,20 +1506,15 @@ if ACTIVE_CONTROLNETS:
                 img = make_controlnet_fallback_image(key, OUTPUT_WIDTH, OUTPUT_HEIGHT)
             controlnet_images.append(img)
 
-        call_kwargs["image"] = (
-            controlnet_images[0]
-            if len(controlnet_images) == 1
-            else controlnet_images
-        )
+        force_list = len(controlnet_key_order) > 1
+        call_kwargs["image"] = controlnet_images if force_list else controlnet_images[0]
         call_kwargs["width"], call_kwargs["height"] = controlnet_images[0].size
 
         scales = [
             CONTROLNET_CONDITIONING_SCALES.get(key, 1.0)
             for key in controlnet_key_order
         ]
-        call_kwargs["controlnet_conditioning_scale"] = (
-            scales[0] if len(scales) == 1 else scales
-        )
+        call_kwargs["controlnet_conditioning_scale"] = scales if force_list else scales[0]
 else:
     call_kwargs["width"] = OUTPUT_WIDTH
     call_kwargs["height"] = OUTPUT_HEIGHT
@@ -1902,9 +1987,31 @@ seeds = [1001, 1002, 1003, 1004]
 num_steps = 30
 guidance_scale = 5.5
 
+controlnet_key_order = (
+    [key for key, model in CONTROLNETS.items() if model is not None]
+    if "CONTROLNETS" in globals()
+    else list(active_controlnet_keys)
+)
+if controlnet_key_order:
+    active_controlnet_keys = list(controlnet_key_order)
+
 controlnet_conditioning_images = []
-for key in active_controlnet_keys:
-    controlnet_conditioning_images.append(conditioning_by_key[key])
+missing_controlnet_keys = []
+base_size = source_image.size if source_image is not None else (OUTPUT_WIDTH, OUTPUT_HEIGHT)
+
+for key in controlnet_key_order:
+    img = conditioning_by_key.get(key)
+    if img is None:
+        missing_controlnet_keys.append(key)
+        img = make_controlnet_fallback_image(key, base_size[0], base_size[1])
+    controlnet_conditioning_images.append(img)
+
+if missing_controlnet_keys:
+    print(
+        "ControlNet conditioning map missing for: "
+        + ", ".join(missing_controlnet_keys)
+        + "; using fallback images."
+    )
 
 results = []
 for seed in seeds:
@@ -1917,20 +2024,19 @@ for seed in seeds:
     }
 
     if controlnet_conditioning_images:
+        force_list = len(controlnet_key_order) > 1
         call_kwargs["image"] = (
-            controlnet_conditioning_images[0]
-            if len(controlnet_conditioning_images) == 1
-            else controlnet_conditioning_images
+            controlnet_conditioning_images if force_list else controlnet_conditioning_images[0]
         )
         cond_w, cond_h = controlnet_conditioning_images[0].size
         call_kwargs["width"] = cond_w
         call_kwargs["height"] = cond_h
 
-        scales = []
-        for key in active_controlnet_keys:
-            scale = CONTROLNET_CONDITIONING_SCALES.get(key, 1.0)
-            scales.append(scale)
-        call_kwargs["controlnet_conditioning_scale"] = scales[0] if len(scales) == 1 else scales
+        scales = [
+            CONTROLNET_CONDITIONING_SCALES.get(key, 1.0)
+            for key in controlnet_key_order
+        ]
+        call_kwargs["controlnet_conditioning_scale"] = scales if force_list else scales[0]
     else:
         call_kwargs["width"] = OUTPUT_WIDTH
         call_kwargs["height"] = OUTPUT_HEIGHT

@@ -2077,8 +2077,7 @@ print(f"Wrote {meta_path}")
 
 if source_image is not None:
     for label, preview_img in [("Source", source_image)] + [(k.title(), v) for k, v in conditioning_by_key.items()]:
-        print(f"
-{label} preview")
+        print(f"\n{label} preview")
         display(preview_img)
 
 for seed, path, image in results:

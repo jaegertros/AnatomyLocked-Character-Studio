@@ -1638,7 +1638,7 @@ def _normalize_set_name(name: str) -> str:
     name = (name or "").strip()
     if not name:
         return ""
-    for ch in ["/", "\", ":", "|"]:
+    for ch in ["/", "\\", ":", "|"]:
         name = name.replace(ch, "_")
     return name
 
@@ -2316,6 +2316,657 @@ else:
         notes=notes,
         metadata=candidate_metadata,
     )
+
+# SECTION 5 — Identity Locking & Invariant Feature Definition (Core Implementation)
+import hashlib
+from typing import Any
+
+import numpy as np
+from PIL import Image
+
+IDENTITY_LOCK_CONFIG = {
+    "require_face_detection": False,
+    "fail_on_missing_mask": True,
+    "insightface_threshold_centroid_min": 0.35,
+    "insightface_threshold_best_ref_min": 0.45,
+    "clip_threshold_centroid_min": 0.82,
+    "clip_threshold_best_ref_min": 0.86,
+    "phash_threshold_hamming_max": 10,
+    "clip_model_id": "openai/clip-vit-base-patch32",
+}
+
+_IDENTITY_BACKEND_CACHE = {
+    "insightface_app": None,
+    "clip_processor": None,
+    "clip_model": None,
+    "clip_device": "cpu",
+}
+
+
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _character_dir(character_id: str) -> Path:
+    character_dir = CHARACTER_ROOT / character_id
+    if not character_dir.exists():
+        raise FileNotFoundError(f"Character not found: {character_dir}")
+    return character_dir
+
+
+def _character_record_path(character_id: str) -> Path:
+    return _character_dir(character_id) / "character.json"
+
+
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_resample_lanczos():
+    return Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+
+
+def _normalize_vector(vector) -> np.ndarray | None:
+    arr = np.asarray(vector, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return None
+    norm = float(np.linalg.norm(arr))
+    if norm <= 0.0:
+        return None
+    return (arr / norm).astype(np.float32)
+
+
+def _vector_centroid(vectors: list) -> np.ndarray | None:
+    normalized = []
+    for vector in vectors:
+        n = _normalize_vector(vector)
+        if n is not None:
+            normalized.append(n)
+    if not normalized:
+        return None
+    stacked = np.vstack(normalized)
+    return _normalize_vector(stacked.mean(axis=0))
+
+
+def _cosine_similarity(vec_a, vec_b) -> float | None:
+    a = _normalize_vector(vec_a)
+    b = _normalize_vector(vec_b)
+    if a is None or b is None or a.shape != b.shape:
+        return None
+    return float(np.dot(a, b))
+
+
+def _copy_to_character_subdir(
+    character_dir: Path,
+    source_path: str | Path,
+    subdir: str,
+    target_name: str,
+) -> tuple[str, str]:
+    src = Path(source_path).expanduser()
+    if not src.exists():
+        raise FileNotFoundError(f"Source file not found: {src}")
+
+    dst_dir = character_dir / subdir
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / target_name
+    shutil.copy2(src, dst)
+    return dst.relative_to(character_dir).as_posix(), _sha256_file(dst)
+
+
+def _load_image_rgb(path: Path) -> Image.Image:
+    with Image.open(path) as handle:
+        return handle.convert("RGB")
+
+
+def _load_insightface_app() -> tuple[Any | None, list[str]]:
+    warnings = []
+    cached = _IDENTITY_BACKEND_CACHE.get("insightface_app")
+    if cached is not None:
+        return cached, warnings
+
+    try:
+        from insightface.app import FaceAnalysis
+    except Exception as exc:
+        warnings.append(f"InsightFace import failed: {exc}")
+        return None, warnings
+
+    provider_attempts = [
+        (["CUDAExecutionProvider", "CPUExecutionProvider"], 0),
+        (["CPUExecutionProvider"], -1),
+        (None, -1),
+    ]
+    for providers, ctx_id in provider_attempts:
+        try:
+            kwargs = {"name": "buffalo_l"}
+            if providers is not None:
+                kwargs["providers"] = providers
+            app = FaceAnalysis(**kwargs)
+            app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+            _IDENTITY_BACKEND_CACHE["insightface_app"] = app
+            return app, warnings
+        except Exception as exc:
+            label = ",".join(providers) if providers else "default"
+            warnings.append(f"InsightFace init failed ({label}): {exc}")
+
+    return None, warnings
+
+
+def _extract_insightface_embedding(image: Image.Image) -> tuple[np.ndarray | None, list[str]]:
+    app, warnings = _load_insightface_app()
+    if app is None:
+        return None, warnings
+
+    rgb = np.asarray(image.convert("RGB"))
+    if rgb.ndim != 3 or rgb.shape[2] != 3:
+        warnings.append("InsightFace skipped due to invalid image format.")
+        return None, warnings
+    bgr = rgb[:, :, ::-1]
+
+    try:
+        faces = app.get(bgr)
+    except Exception as exc:
+        warnings.append(f"InsightFace face detection failed: {exc}")
+        return None, warnings
+
+    if not faces:
+        warnings.append("InsightFace found no face in image.")
+        return None, warnings
+
+    def _face_area(face_obj):
+        try:
+            x0, y0, x1, y1 = face_obj.bbox
+            return float(max(0.0, x1 - x0) * max(0.0, y1 - y0))
+        except Exception:
+            return 0.0
+
+    face = max(faces, key=_face_area)
+    emb = getattr(face, "normed_embedding", None)
+    if emb is None:
+        emb = getattr(face, "embedding", None)
+    vec = _normalize_vector(emb)
+    if vec is None:
+        warnings.append("InsightFace returned an invalid embedding.")
+        return None, warnings
+    return vec, warnings
+
+
+def _load_clip_stack() -> tuple[tuple[Any, Any, str] | None, list[str]]:
+    warnings = []
+    processor = _IDENTITY_BACKEND_CACHE.get("clip_processor")
+    model = _IDENTITY_BACKEND_CACHE.get("clip_model")
+    device = _IDENTITY_BACKEND_CACHE.get("clip_device", "cpu")
+    if processor is not None and model is not None:
+        return (processor, model, device), warnings
+
+    try:
+        import torch
+        from transformers import CLIPModel, CLIPProcessor
+    except Exception as exc:
+        warnings.append(f"CLIP import failed: {exc}")
+        return None, warnings
+
+    model_id = IDENTITY_LOCK_CONFIG["clip_model_id"]
+    try:
+        processor = CLIPProcessor.from_pretrained(model_id)
+        model = CLIPModel.from_pretrained(model_id)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+        model.eval()
+        _IDENTITY_BACKEND_CACHE["clip_processor"] = processor
+        _IDENTITY_BACKEND_CACHE["clip_model"] = model
+        _IDENTITY_BACKEND_CACHE["clip_device"] = device
+        return (processor, model, device), warnings
+    except Exception as exc:
+        warnings.append(f"CLIP model load failed ({model_id}): {exc}")
+        return None, warnings
+
+
+def _extract_clip_embedding(image: Image.Image) -> tuple[np.ndarray | None, list[str]]:
+    stack, warnings = _load_clip_stack()
+    if stack is None:
+        return None, warnings
+
+    processor, model, device = stack
+    try:
+        import torch
+
+        inputs = processor(images=image.convert("RGB"), return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            features = model.get_image_features(**inputs)
+        vec = _normalize_vector(features[0].detach().cpu().numpy())
+    except Exception as exc:
+        warnings.append(f"CLIP embedding failed: {exc}")
+        return None, warnings
+
+    if vec is None:
+        warnings.append("CLIP returned an invalid embedding.")
+        return None, warnings
+    return vec, warnings
+
+
+def _dhash_hex(image: Image.Image, hash_size: int = 8) -> str:
+    resized = image.convert("L").resize((hash_size + 1, hash_size), _safe_resample_lanczos())
+    pixels = np.asarray(resized, dtype=np.int16)
+    diff = pixels[:, 1:] > pixels[:, :-1]
+    bit_string = "".join("1" if v else "0" for v in diff.flatten())
+    width = (hash_size * hash_size) // 4
+    return f"{int(bit_string, 2):0{width}x}"
+
+
+def _extract_phash_hex(image: Image.Image) -> tuple[str | None, list[str]]:
+    warnings = []
+    try:
+        import imagehash
+
+        return str(imagehash.phash(image.convert("RGB"))), warnings
+    except Exception as exc:
+        warnings.append(f"imagehash unavailable ({exc}); using dhash fallback.")
+        try:
+            return _dhash_hex(image), warnings
+        except Exception as inner_exc:
+            warnings.append(f"dhash fallback failed: {inner_exc}")
+            return None, warnings
+
+
+def _hamming_distance_hex(hex_a: str, hex_b: str) -> int:
+    a = int(hex_a, 16)
+    b = int(hex_b, 16)
+    return int((a ^ b).bit_count())
+
+
+def _collect_reference_fingerprints(reference_images: list[Image.Image]) -> tuple[dict, list[str]]:
+    warnings = []
+    insightface_vectors = []
+    clip_vectors = []
+    phash_values = []
+
+    for index, image in enumerate(reference_images):
+        i_vec, i_warn = _extract_insightface_embedding(image)
+        warnings.extend([f"reference[{index}] {msg}" for msg in i_warn])
+        if i_vec is not None:
+            insightface_vectors.append(i_vec.tolist())
+
+        c_vec, c_warn = _extract_clip_embedding(image)
+        warnings.extend([f"reference[{index}] {msg}" for msg in c_warn])
+        if c_vec is not None:
+            clip_vectors.append(c_vec.tolist())
+
+        p_hash, p_warn = _extract_phash_hex(image)
+        warnings.extend([f"reference[{index}] {msg}" for msg in p_warn])
+        if p_hash is not None:
+            phash_values.append(p_hash)
+
+    insightface_centroid = _vector_centroid(insightface_vectors)
+    clip_centroid = _vector_centroid(clip_vectors)
+
+    fingerprints = {
+        "backend_used": None,
+        "insightface": {
+            "available": bool(insightface_vectors),
+            "embedding_dim": len(insightface_vectors[0]) if insightface_vectors else 512,
+            "reference_embeddings": insightface_vectors,
+            "centroid": insightface_centroid.tolist() if insightface_centroid is not None else [],
+            "threshold_centroid_min": float(IDENTITY_LOCK_CONFIG["insightface_threshold_centroid_min"]),
+            "threshold_best_ref_min": float(IDENTITY_LOCK_CONFIG["insightface_threshold_best_ref_min"]),
+        },
+        "clip": {
+            "available": bool(clip_vectors),
+            "embedding_dim": len(clip_vectors[0]) if clip_vectors else 1024,
+            "reference_embeddings": clip_vectors,
+            "centroid": clip_centroid.tolist() if clip_centroid is not None else [],
+            "threshold_centroid_min": float(IDENTITY_LOCK_CONFIG["clip_threshold_centroid_min"]),
+            "threshold_best_ref_min": float(IDENTITY_LOCK_CONFIG["clip_threshold_best_ref_min"]),
+        },
+        "phash": {
+            "available": bool(phash_values),
+            "reference_hashes": phash_values,
+            "threshold_hamming_max": int(IDENTITY_LOCK_CONFIG["phash_threshold_hamming_max"]),
+        },
+    }
+
+    if fingerprints["insightface"]["available"]:
+        fingerprints["backend_used"] = "insightface"
+    elif fingerprints["clip"]["available"]:
+        fingerprints["backend_used"] = "clip"
+    elif fingerprints["phash"]["available"]:
+        fingerprints["backend_used"] = "phash"
+
+    return fingerprints, warnings
+
+
+def _extract_candidate_fingerprints(candidate_image: Image.Image) -> tuple[dict, list[str]]:
+    warnings = []
+    i_vec, i_warn = _extract_insightface_embedding(candidate_image)
+    warnings.extend(i_warn)
+    c_vec, c_warn = _extract_clip_embedding(candidate_image)
+    warnings.extend(c_warn)
+    p_hash, p_warn = _extract_phash_hex(candidate_image)
+    warnings.extend(p_warn)
+
+    return {
+        "insightface": i_vec.tolist() if i_vec is not None else None,
+        "clip": c_vec.tolist() if c_vec is not None else None,
+        "phash": p_hash,
+    }, warnings
+
+
+def load_character_record(character_id: str) -> dict:
+    record_path = _character_record_path(character_id)
+    if not record_path.exists():
+        raise FileNotFoundError(f"Character record not found: {record_path}")
+    with record_path.open("r", encoding="utf-8") as handle:
+        record = json.load(handle)
+    if not isinstance(record, dict):
+        raise ValueError(f"Character record is not a dict: {record_path}")
+    return record
+
+
+def save_character_record(character_id: str, record: dict) -> Path:
+    if not isinstance(record, dict):
+        raise TypeError("record must be a dictionary")
+    record_path = _character_record_path(character_id)
+    record_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return record_path
+
+
+def create_identity_lock(
+    character_id: str,
+    reference_image_paths: list[str],
+    invariant_features: list[dict],
+    locked_regions: list[str],
+    notes: str = "",
+) -> dict:
+    if not reference_image_paths:
+        raise ValueError("reference_image_paths must include at least one image")
+
+    character_dir = _character_dir(character_id)
+    record = load_character_record(character_id)
+
+    reference_entries = []
+    reference_images = []
+    for index, source in enumerate(reference_image_paths, start=1):
+        src_path = Path(source).expanduser()
+        ext = src_path.suffix.lower() or ".png"
+        target_name = f"ref_{index:03d}{ext}"
+        rel_path, sha256 = _copy_to_character_subdir(
+            character_dir,
+            src_path,
+            "identity/reference",
+            target_name,
+        )
+        reference_entries.append({"file": rel_path, "sha256": sha256})
+        reference_images.append(_load_image_rgb(character_dir / rel_path))
+
+    invariant_entries = []
+    for index, feature in enumerate(invariant_features or [], start=1):
+        if not isinstance(feature, dict):
+            raise TypeError(f"Invariant feature at index {index - 1} must be a dict")
+        feature_id = str(feature.get("id") or f"INV-{index:03d}")
+        kind = str(feature.get("kind") or "other")
+        region = str(feature.get("region") or "unspecified")
+        description = str(feature.get("description") or "")
+
+        mask_source = feature.get("mask_path")
+        mask_rel = None
+        mask_sha = None
+        if mask_source:
+            mask_source_path = Path(str(mask_source)).expanduser()
+            mask_ext = mask_source_path.suffix.lower() or ".png"
+            mask_name = f"{feature_id.lower().replace(' ', '_')}{mask_ext}"
+            mask_rel, mask_sha = _copy_to_character_subdir(
+                character_dir,
+                mask_source_path,
+                "identity/masks",
+                mask_name,
+            )
+
+        invariant_entries.append({
+            "id": feature_id,
+            "kind": kind,
+            "region": region,
+            "description": description,
+            "mask_file": mask_rel,
+            "mask_sha256": mask_sha,
+        })
+
+    fingerprints, fingerprint_warnings = _collect_reference_fingerprints(reference_images)
+    if fingerprints.get("backend_used") is None:
+        raise RuntimeError("Unable to compute any fingerprint backend for identity lock.")
+
+    if IDENTITY_LOCK_CONFIG["require_face_detection"] and not fingerprints["insightface"]["available"]:
+        raise RuntimeError("InsightFace face detection is required but no face embedding was produced.")
+
+    identity_lock = {
+        "status": "locked",
+        "locked_at": _utc_now_iso(),
+        "locked_regions": list(locked_regions or []),
+        "notes": str(notes or ""),
+        "reference_images": reference_entries,
+        "invariants": {
+            "features": invariant_entries,
+        },
+        "fingerprints": fingerprints,
+        "last_validation": None,
+    }
+    if fingerprint_warnings:
+        identity_lock["warnings"] = fingerprint_warnings
+
+    record["identity_lock"] = identity_lock
+    save_character_record(character_id, record)
+    print(f"Identity lock created for {character_id} using backend={fingerprints['backend_used']}.")
+    return identity_lock
+
+
+def validate_identity_lock(character_id: str, candidate_image_path: str) -> dict:
+    candidate_path = Path(candidate_image_path).expanduser()
+    if not candidate_path.exists():
+        raise FileNotFoundError(f"Candidate image not found: {candidate_path}")
+
+    record = load_character_record(character_id)
+    identity_lock = record.get("identity_lock")
+    if not isinstance(identity_lock, dict):
+        raise ValueError(f"Character {character_id} does not contain an identity_lock block.")
+
+    stored_fingerprints = identity_lock.get("fingerprints", {})
+    candidate_image = _load_image_rgb(candidate_path)
+    candidate_fingerprints, candidate_warnings = _extract_candidate_fingerprints(candidate_image)
+
+    backend_used = None
+    backend_pass = False
+    metrics = {}
+    reasons = []
+
+    stored_insight = stored_fingerprints.get("insightface", {})
+    stored_clip = stored_fingerprints.get("clip", {})
+    stored_phash = stored_fingerprints.get("phash", {})
+
+    if stored_insight.get("available") and candidate_fingerprints.get("insightface") is not None:
+        backend_used = "insightface"
+        candidate_vec = candidate_fingerprints["insightface"]
+        centroid = stored_insight.get("centroid") or []
+        ref_vectors = stored_insight.get("reference_embeddings") or []
+        centroid_sim = _cosine_similarity(candidate_vec, centroid) if centroid else None
+        best_ref_sim = None
+        if ref_vectors:
+            similarities = [_cosine_similarity(candidate_vec, ref) for ref in ref_vectors]
+            similarities = [s for s in similarities if s is not None]
+            best_ref_sim = max(similarities) if similarities else None
+
+        threshold_centroid = float(stored_insight.get(
+            "threshold_centroid_min",
+            IDENTITY_LOCK_CONFIG["insightface_threshold_centroid_min"],
+        ))
+        threshold_best_ref = float(stored_insight.get(
+            "threshold_best_ref_min",
+            IDENTITY_LOCK_CONFIG["insightface_threshold_best_ref_min"],
+        ))
+        centroid_ok = centroid_sim is not None and centroid_sim >= threshold_centroid
+        best_ref_ok = best_ref_sim is not None and best_ref_sim >= threshold_best_ref
+        backend_pass = centroid_ok and best_ref_ok
+        metrics.update({
+            "similarity_centroid": centroid_sim,
+            "similarity_best_ref": best_ref_sim,
+            "threshold_centroid_min": threshold_centroid,
+            "threshold_best_ref_min": threshold_best_ref,
+            "centroid_pass": centroid_ok,
+            "best_ref_pass": best_ref_ok,
+        })
+        if not centroid_ok:
+            reasons.append("InsightFace centroid similarity below threshold.")
+        if not best_ref_ok:
+            reasons.append("InsightFace best-reference similarity below threshold.")
+    elif stored_clip.get("available") and candidate_fingerprints.get("clip") is not None:
+        backend_used = "clip"
+        candidate_vec = candidate_fingerprints["clip"]
+        centroid = stored_clip.get("centroid") or []
+        ref_vectors = stored_clip.get("reference_embeddings") or []
+        centroid_sim = _cosine_similarity(candidate_vec, centroid) if centroid else None
+        best_ref_sim = None
+        if ref_vectors:
+            similarities = [_cosine_similarity(candidate_vec, ref) for ref in ref_vectors]
+            similarities = [s for s in similarities if s is not None]
+            best_ref_sim = max(similarities) if similarities else None
+
+        threshold_centroid = float(stored_clip.get(
+            "threshold_centroid_min",
+            IDENTITY_LOCK_CONFIG["clip_threshold_centroid_min"],
+        ))
+        threshold_best_ref = float(stored_clip.get(
+            "threshold_best_ref_min",
+            IDENTITY_LOCK_CONFIG["clip_threshold_best_ref_min"],
+        ))
+        centroid_ok = centroid_sim is not None and centroid_sim >= threshold_centroid
+        best_ref_ok = best_ref_sim is not None and best_ref_sim >= threshold_best_ref
+        backend_pass = centroid_ok and best_ref_ok
+        metrics.update({
+            "similarity_centroid": centroid_sim,
+            "similarity_best_ref": best_ref_sim,
+            "threshold_centroid_min": threshold_centroid,
+            "threshold_best_ref_min": threshold_best_ref,
+            "centroid_pass": centroid_ok,
+            "best_ref_pass": best_ref_ok,
+        })
+        if not centroid_ok:
+            reasons.append("CLIP centroid similarity below threshold.")
+        if not best_ref_ok:
+            reasons.append("CLIP best-reference similarity below threshold.")
+    elif stored_phash.get("available") and candidate_fingerprints.get("phash"):
+        backend_used = "phash"
+        candidate_hash = candidate_fingerprints["phash"]
+        ref_hashes = stored_phash.get("reference_hashes") or []
+        threshold_max = int(stored_phash.get(
+            "threshold_hamming_max",
+            IDENTITY_LOCK_CONFIG["phash_threshold_hamming_max"],
+        ))
+        if ref_hashes:
+            distances = [_hamming_distance_hex(candidate_hash, ref_hash) for ref_hash in ref_hashes]
+            best_distance = min(distances)
+        else:
+            best_distance = None
+        backend_pass = best_distance is not None and best_distance <= threshold_max
+        metrics.update({
+            "hamming_best_ref": best_distance,
+            "threshold_hamming_max": threshold_max,
+        })
+        if not backend_pass:
+            reasons.append("pHash hamming distance above threshold.")
+    else:
+        reasons.append("No compatible fingerprint backend available for validation.")
+
+    mask_pass = True
+    missing_masks = []
+    mismatched_masks = []
+    for feature in identity_lock.get("invariants", {}).get("features", []):
+        if not isinstance(feature, dict):
+            continue
+        mask_rel = feature.get("mask_file")
+        expected_sha = feature.get("mask_sha256")
+        if not mask_rel:
+            continue
+        mask_path = _character_dir(character_id) / mask_rel
+        if not mask_path.exists():
+            missing_masks.append(mask_rel)
+            if IDENTITY_LOCK_CONFIG["fail_on_missing_mask"]:
+                mask_pass = False
+            continue
+        if expected_sha:
+            actual_sha = _sha256_file(mask_path)
+            if actual_sha != expected_sha:
+                mismatched_masks.append(mask_rel)
+                if IDENTITY_LOCK_CONFIG["fail_on_missing_mask"]:
+                    mask_pass = False
+
+    if missing_masks:
+        reasons.append(f"Missing invariant mask files: {missing_masks}")
+    if mismatched_masks:
+        reasons.append(f"Invariant mask hash mismatches: {mismatched_masks}")
+    if IDENTITY_LOCK_CONFIG["require_face_detection"] and backend_used != "insightface":
+        reasons.append("Face detection required, but validation used a fallback backend.")
+        backend_pass = False
+
+    validation_pass = backend_pass and mask_pass
+    validation_report = {
+        "timestamp": _utc_now_iso(),
+        "pass": validation_pass,
+        "backend_used": backend_used,
+        "metrics": metrics,
+        "candidate_image": str(candidate_path),
+        "warnings": candidate_warnings,
+        "reasons": reasons,
+    }
+
+    identity_lock["last_validation"] = validation_report
+    record["identity_lock"] = identity_lock
+    save_character_record(character_id, record)
+
+    print(json.dumps(validation_report, indent=2))
+    return validation_report
+
+
+print("Section 5 identity lock configuration:")
+print(json.dumps(IDENTITY_LOCK_CONFIG, indent=2))
+
+# Section 5 usage example — create lock
+identity_lock_character_id = "CH-0001"
+identity_reference_image_paths = []  # e.g., ["/content/drive/My Drive/AI/Images/identity/front.png"]
+identity_invariant_features = [
+    # {"id": "INV-001", "kind": "scar", "region": "left_cheek", "description": "Small vertical scar", "mask_path": "/path/to/mask.png"},
+]
+identity_locked_regions = ["face", "torso"]
+identity_lock_notes = ""
+
+if identity_reference_image_paths:
+    created_identity_lock = create_identity_lock(
+        character_id=identity_lock_character_id,
+        reference_image_paths=identity_reference_image_paths,
+        invariant_features=identity_invariant_features,
+        locked_regions=identity_locked_regions,
+        notes=identity_lock_notes,
+    )
+    print(f"Created identity lock with backend: {created_identity_lock['fingerprints']['backend_used']}")
+else:
+    print("Set identity_reference_image_paths to create an identity lock.")
+
+# Section 5 usage example — validate a candidate
+validation_character_id = identity_lock_character_id
+validation_candidate_image_path = ""  # e.g., /content/drive/My Drive/AI/Images/renders/candidate.png
+
+if validation_candidate_image_path:
+    validation_result = validate_identity_lock(
+        character_id=validation_character_id,
+        candidate_image_path=validation_candidate_image_path,
+    )
+    print(f"Validation pass: {validation_result['pass']}")
+else:
+    print("Set validation_candidate_image_path to run identity validation.")
 
 """
 ---

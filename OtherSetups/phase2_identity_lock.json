@@ -1,5 +1,5 @@
 {
-  "last_node_id": 22,
+  "last_node_id": 23,
   "last_link_id": 30,
   "nodes": [
     {
@@ -406,6 +406,21 @@
       "outputs": [],
       "properties": {
         "text": "Body IP-Adapter:\n  weight (0.4) = body appearance nudge\n  end_at (0.75) = stop early, let pose win\n\n  Lower weight if pose is being ignored.\n  This node is optional — bypass to disable."
+      }
+    },
+
+    {
+      "id": 23,
+      "type": "Note",
+      "pos": [420, 1420],
+      "size": {"0": 560, "1": 220},
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "text": "Direction image usage:\n  - Character Reference accepts any image in ComfyUI input.\n  - It does not need to come from Phase 1 generation.\n  - Drop/copy files into ComfyUI input, then select in LoadImage.\n\nTuning reminder:\n  - Keep FaceID weight high (0.85-1.0) for identity lock.\n  - Lower Body IP-Adapter weight if it fights pose."
       }
     }
   ],

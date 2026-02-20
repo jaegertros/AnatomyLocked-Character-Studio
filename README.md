@@ -44,6 +44,29 @@ This is not a random image generator. Once a character is finalized, identity mu
 3. Iterate region-by-region while keeping locked regions fixed
 4. Generate standardized character set outputs and validate against the checklist
 
+## Direction Image Usage (ComfyUI)
+
+- `OtherSetups/phase2_identity_lock.json` already supports external images through its two `LoadImage` nodes.
+- You can use any image for look direction in `Character Reference` (it does not have to come from Phase 1 generation).
+- Place/upload your files into ComfyUI `input` (drag-and-drop in ComfyUI also lands files there), then pick them from each `LoadImage` dropdown.
+- Keep FaceID weight high (`0.85-1.0`) for stronger identity lock.
+- Lower body IP-Adapter weight (for example, `0.4 -> 0.2`) if it fights pose adherence.
+
+## Section 5 Identity Lock (Notebook/Script)
+
+- Canonical character state is stored at `datasets/characters/<character_id>/character.json`.
+- Section 5 adds an `identity_lock` block with:
+  - reference image registrations + SHA-256 checksums
+  - invariant feature entries (with optional mask files and mask checksums)
+  - fingerprint metadata and thresholds
+  - latest validation result (`last_validation`)
+- Fingerprint backend fallback order is deterministic:
+  - `insightface` -> `clip` -> `phash`
+- Default behavior:
+  - `require_face_detection = False`
+  - `fail_on_missing_mask = True`
+- Comfy translation for this lock schema is intentionally deferred until notebook Sections 5-8 are stable.
+
 ## Checklist
 
 See Character_Set_Validation_Checklist.md for a validation template.

@@ -110,11 +110,18 @@ download(
 
 ## Workflow import
 
-1. Open ComfyUI in your browser
-2. Drag `phase1_exploration.json` onto the canvas, or use Load button
-3. When you have a character you like from Phase 1, load `phase2_identity_lock.json`
-4. Set the "Character Reference" LoadImage node to your Phase 1 candidate
-5. Set "Pose Reference" to your 3d.sk photo
+1. Open ComfyUI in your browser.
+2. Drag `phase1_exploration.json` onto the canvas, or use Load button.
+3. When you have a character you like from Phase 1, load `phase2_identity_lock.json`.
+4. Set the `Character Reference` LoadImage node to your reference image.
+5. Set `Pose Reference` to your pose image.
+
+## External image direction support (current behavior)
+
+- You are not limited to images generated in Phase 1.
+- `Character Reference` and `Pose Reference` accept any image available in ComfyUI `input`.
+- To use a local photo, copy/upload it into ComfyUI `input` (or drag-and-drop into ComfyUI), then select it from each `LoadImage` dropdown.
+- Images not present in `input` will not appear in `LoadImage`.
 
 ---
 

@@ -2990,6 +2990,48 @@ SECTION6_REQUIRED_REGION_KEYS = [region_id for region_id, _, _, _ in SECTION6_RE
 SECTION6_REQUIRED_MASK_REGIONS = list(SECTION6_REQUIRED_REGION_KEYS)
 
 
+SECTION6_REGION_MASK_SUBDIR = "identity/masks/regions"
+
+
+def _section6_region_slug(region_id: str) -> str:
+    slug = "".join(ch.lower() if (ch.isalnum() or ch in {"_", "-"}) else "_" for ch in str(region_id).strip())
+    slug = "_".join(filter(None, slug.replace("-", "_").split("_")))
+    if not slug:
+        raise ValueError(f"Invalid region_id for mask path resolution: {region_id!r}")
+    return slug
+
+
+def _section6_region_mask_target_name(region_id: str, source_path: str | Path | None = None) -> str:
+    ext = ".png"
+    if source_path is not None:
+        ext = Path(source_path).suffix.lower() or ".png"
+    return f"{_section6_region_slug(region_id)}{ext}"
+
+
+def _section6_region_mask_relpath(region_id: str, source_path: str | Path | None = None) -> str:
+    return f"{SECTION6_REGION_MASK_SUBDIR}/{_section6_region_mask_target_name(region_id, source_path)}"
+
+
+def _read_mask_metadata(mask_path: Path) -> dict:
+    metadata = {
+        "exists": mask_path.exists(),
+        "relative_path": mask_path.as_posix(),
+    }
+    if not mask_path.exists():
+        return metadata
+
+    metadata["sha256"] = _sha256_file(mask_path)
+    try:
+        with Image.open(mask_path) as image:
+            metadata["format"] = image.format
+            metadata["mode"] = image.mode
+            metadata["width"] = image.width
+            metadata["height"] = image.height
+    except Exception as exc:
+        metadata["warning"] = f"Unable to parse mask image metadata: {exc}"
+    return metadata
+
+
 def _default_body_region_entry(
     region_id: str,
     label: str,
@@ -3000,7 +3042,8 @@ def _default_body_region_entry(
         "label": label,
         "side": side,
         "parent_group": parent_group,
-        "mask_path": None,
+        "mask_path": _section6_region_mask_relpath(region_id),
+        "mask_metadata": None,
         "is_locked": False,
         "notes": None,
     }
@@ -3017,6 +3060,7 @@ def build_default_body_region_map(*, source: str = "section6_initializer", pose_
         "source": source,
         "pose_reference": pose_reference,
         "image_reference": image_reference,
+        "mask_root": SECTION6_REGION_MASK_SUBDIR,
         "regions": regions,
     }
 
@@ -3026,6 +3070,15 @@ def ensure_body_region_map(character_id: str, *, source: str = "section6_initial
     record = load_character_record(character_id)
     existing_map = record.get("body_region_map")
     if isinstance(existing_map, dict) and isinstance(existing_map.get("regions"), dict):
+        if "mask_root" not in existing_map:
+            existing_map["mask_root"] = SECTION6_REGION_MASK_SUBDIR
+        for region_id, region_data in existing_map.get("regions", {}).items():
+            if not isinstance(region_data, dict):
+                continue
+            if not region_data.get("mask_path"):
+                region_data["mask_path"] = _section6_region_mask_relpath(region_id)
+        record["body_region_map"] = existing_map
+        save_character_record(character_id, record)
         return existing_map
 
     body_region_map = build_default_body_region_map(
@@ -3187,6 +3240,16 @@ body_region_map = ensure_body_region_map(
     source=section6_source,
     pose_reference=section6_pose_reference,
     image_reference=section6_image_reference,
+)
+
+section6_region_masks = {
+    # "head": "/path/to/head_mask.png",
+    # "chest": "/path/to/chest_mask.png",
+}
+body_region_map = register_body_region_mask_paths(
+    section6_character_id,
+    section6_region_masks,
+    validate_existing=True,
 )
 print("Section 6 body_region_map ready:")
 print(json.dumps(body_region_map, indent=2))

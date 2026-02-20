@@ -2968,6 +2968,87 @@ if validation_candidate_image_path:
 else:
     print("Set validation_candidate_image_path to run identity validation.")
 
+
+# SECTION 6 — Body Region Map Creation (Distinctive Anchor: S6_BODY_REGION_MAP_SCHEMA_V1)
+SECTION6_BODY_REGION_SCHEMA_VERSION = "section6.body_region_map.v1"
+SECTION6_REGION_DEFAULTS = [
+    ("head", "Head", "none", "core"),
+    ("neck", "Neck", "none", "core"),
+    ("shoulders", "Shoulders", "bilateral", "upper_body"),
+    ("chest", "Chest", "none", "torso"),
+    ("abdomen", "Abdomen", "none", "torso"),
+    ("hips", "Hips", "bilateral", "pelvis"),
+    ("thighs", "Thighs", "bilateral", "legs"),
+    ("calves", "Calves", "bilateral", "legs"),
+    ("upper_arms", "Upper Arms", "bilateral", "arms"),
+    ("forearms", "Forearms", "bilateral", "arms"),
+    ("hands", "Hands", "bilateral", "arms"),
+    ("feet", "Feet", "bilateral", "legs"),
+]
+
+
+def _default_body_region_entry(
+    region_id: str,
+    label: str,
+    side: str,
+    parent_group: str,
+) -> dict:
+    return {
+        "label": label,
+        "side": side,
+        "parent_group": parent_group,
+        "mask_path": None,
+        "is_locked": False,
+        "notes": None,
+    }
+
+
+def build_default_body_region_map(*, source: str = "section6_initializer", pose_reference: str | None = None, image_reference: str | None = None) -> dict:
+    regions = {
+        region_id: _default_body_region_entry(region_id, label, side, parent_group)
+        for region_id, label, side, parent_group in SECTION6_REGION_DEFAULTS
+    }
+    return {
+        "schema_version": SECTION6_BODY_REGION_SCHEMA_VERSION,
+        "created_at": _utc_now_iso(),
+        "source": source,
+        "pose_reference": pose_reference,
+        "image_reference": image_reference,
+        "regions": regions,
+    }
+
+
+def ensure_body_region_map(character_id: str, *, source: str = "section6_initializer", pose_reference: str | None = None, image_reference: str | None = None) -> dict:
+    """Backward-safe initializer for Section 6 payload under character.json."""
+    record = load_character_record(character_id)
+    existing_map = record.get("body_region_map")
+    if isinstance(existing_map, dict) and isinstance(existing_map.get("regions"), dict):
+        return existing_map
+
+    body_region_map = build_default_body_region_map(
+        source=source,
+        pose_reference=pose_reference,
+        image_reference=image_reference,
+    )
+    record["body_region_map"] = body_region_map
+    save_character_record(character_id, record)
+    return body_region_map
+
+
+section6_character_id = identity_lock_character_id
+section6_source = "notebook.section6"
+section6_pose_reference = None  # e.g., "neutral_a_pose"
+section6_image_reference = None  # e.g., "identity/reference/front.png"
+
+body_region_map = ensure_body_region_map(
+    section6_character_id,
+    source=section6_source,
+    pose_reference=section6_pose_reference,
+    image_reference=section6_image_reference,
+)
+print("Section 6 body_region_map ready:")
+print(json.dumps(body_region_map, indent=2))
+
 """
 ---
 
@@ -2986,7 +3067,7 @@ From this point forward, the character is identity-locked.
 
 ---
 
-# SECTION 6 — Body Region Map Creation
+# SECTION 6 — Body Region Map Creation (Distinctive Anchor: S6_BODY_REGION_MAP_SCHEMA_V1)
 
 **Purpose:**  
 Divide the body into anatomically meaningful regions for refinement.
@@ -3169,4 +3250,3 @@ A sandbox for:
 - Deferred features
 
 This section keeps the rest of the notebook clean."""
-

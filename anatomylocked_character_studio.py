@@ -2156,6 +2156,7 @@ from datetime import datetime
 import json
 import shutil
 import csv
+import uuid
 
 CHARACTER_ROOT = AI_DIRS["datasets"] / "characters"
 CHARACTER_ROOT.mkdir(parents=True, exist_ok=True)
@@ -4800,6 +4801,199 @@ section9_status = get_section9_pose_status(section9_character_id)
 print("Section 9 status:")
 print(json.dumps(section9_status, indent=2))
 
+
+# SECTION 10 — Minimal manifest contract for Section 11 export handoff
+
+SECTION10_SCHEMA_VERSION = "S10_REFERENCE_MANIFEST_V1"
+SECTION10_REQUIRED_BASELINE_VIEWS = ("front", "side", "back")
+SECTION10_APPROVED_STATUS = "approved"
+
+
+def _ensure_section10_state(record: dict, character_id: str) -> dict:
+    state = record.get("section10_reference_views")
+    if not isinstance(state, dict):
+        state = {}
+
+    state.setdefault("schema_version", SECTION10_SCHEMA_VERSION)
+    state.setdefault("character_id", character_id)
+    state.setdefault("runs", [])
+    state.setdefault("latest_run_id", None)
+    state.setdefault("created_at", _utc_now_iso())
+    state["updated_at"] = _utc_now_iso()
+    record["section10_reference_views"] = state
+    return state
+
+
+def _normalize_section10_label(value: str | None, *, default: str = "unspecified") -> str:
+    if not isinstance(value, str) or not value.strip():
+        return default
+    return value.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _normalize_section10_reference_entry(character_dir: Path, reference: dict) -> dict:
+    if not isinstance(reference, dict):
+        raise TypeError("Each reference entry must be a dictionary.")
+
+    rel_file = reference.get("file")
+    if not isinstance(rel_file, str) or not rel_file.strip():
+        raise ValueError("reference.file is required.")
+
+    resolved_path = Path(rel_file).expanduser()
+    if not resolved_path.is_absolute():
+        resolved_path = character_dir / resolved_path
+
+    sha256 = reference.get("sha256")
+    if (not isinstance(sha256, str) or not sha256.strip()) and resolved_path.exists():
+        sha256 = _sha256_file(resolved_path)
+
+    normalized = {
+        "file": rel_file,
+        "sha256": (sha256 or "").strip(),
+        "view_label": _normalize_section10_label(reference.get("view_label")),
+        "lighting_label": _normalize_section10_label(reference.get("lighting_label")),
+        "camera_label": _normalize_section10_label(reference.get("camera_label")),
+        "pose_label": _normalize_section10_label(reference.get("pose_label"), default=""),
+        "is_neutral_baseline": bool(reference.get("is_neutral_baseline")),
+    }
+    return normalized
+
+
+def _extract_section10_baseline_view(camera_label: str, view_label: str) -> str | None:
+    tokens = {camera_label, view_label}
+    if any("front" in token for token in tokens):
+        return "front"
+    if any(token in {"left", "left_side", "right", "right_side", "side"} or "side" in token for token in tokens):
+        return "side"
+    if any("back" in token or "rear" in token for token in tokens):
+        return "back"
+    return None
+
+
+def evaluate_section10_baseline_requirement(references: list[dict]) -> dict:
+    covered_views = set()
+    issues = []
+
+    for ref in references:
+        if not isinstance(ref, dict):
+            continue
+        if not bool(ref.get("is_neutral_baseline")):
+            continue
+        lighting_label = _normalize_section10_label(ref.get("lighting_label"))
+        camera_label = _normalize_section10_label(ref.get("camera_label"))
+        view_label = _normalize_section10_label(ref.get("view_label"))
+
+        if lighting_label != "neutral_studio":
+            continue
+        if "ortho" not in camera_label and "orthographic" not in camera_label:
+            continue
+
+        baseline_view = _extract_section10_baseline_view(camera_label, view_label)
+        if baseline_view:
+            covered_views.add(baseline_view)
+
+    missing_views = [view for view in SECTION10_REQUIRED_BASELINE_VIEWS if view not in covered_views]
+    if missing_views:
+        issues.append(
+            "Missing required neutral baseline orthographic-like views: " + ", ".join(missing_views)
+        )
+
+    return {
+        "pass": not missing_views,
+        "covered_views": sorted(covered_views),
+        "required_views": list(SECTION10_REQUIRED_BASELINE_VIEWS),
+        "issues": issues,
+    }
+
+
+def register_section10_reference_run(
+    character_id: str,
+    references: list[dict],
+    *,
+    approved: bool = True,
+    notes: str | None = None,
+) -> dict:
+    if not isinstance(references, list) or not references:
+        raise ValueError("references must be a non-empty list.")
+
+    record = load_character_record(character_id)
+    character_dir = get_character_dir(character_id)
+    state = _ensure_section10_state(record, character_id)
+
+    normalized_references = [
+        _normalize_section10_reference_entry(character_dir, reference)
+        for reference in references
+    ]
+    baseline_report = evaluate_section10_baseline_requirement(normalized_references)
+
+    run_id = f"s10-{uuid.uuid4().hex[:12]}"
+    run_entry = {
+        "run_id": run_id,
+        "timestamp": _utc_now_iso(),
+        "references": normalized_references,
+        "baseline_report": baseline_report,
+        "approval": {
+            "status": SECTION10_APPROVED_STATUS if approved else "pending",
+            "section10_complete": bool(approved and baseline_report.get("pass")),
+        },
+        "notes": notes,
+    }
+
+    runs = state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    runs.append(run_entry)
+    state["runs"] = runs
+    state["latest_run_id"] = run_id
+    state["updated_at"] = _utc_now_iso()
+    record["section10_reference_views"] = state
+
+    save_character_record(character_id, record)
+    return run_entry
+
+
+def get_section10_reference_catalog(character_id: str) -> dict:
+    record = load_character_record(character_id)
+    state = _ensure_section10_state(record, character_id)
+
+    runs = state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+
+    approved_runs = [
+        run for run in runs
+        if isinstance(run, dict) and ((run.get("approval") or {}).get("status") == SECTION10_APPROVED_STATUS)
+    ]
+    latest_approved_run = approved_runs[-1] if approved_runs else None
+    references = list((latest_approved_run or {}).get("references") or [])
+    baseline_report = evaluate_section10_baseline_requirement(references)
+
+    catalog = {
+        "character_id": character_id,
+        "schema_version": state.get("schema_version"),
+        "latest_approved_run_id": (latest_approved_run or {}).get("run_id"),
+        "references": references,
+        "baseline_report": baseline_report,
+        "section10_complete": bool(
+            latest_approved_run
+            and baseline_report.get("pass")
+            and bool(((latest_approved_run.get("approval") or {}).get("section10_complete")))
+        ),
+    }
+    save_character_record(character_id, record)
+    return catalog
+
+
+def get_section10_status(character_id: str) -> dict:
+    catalog = get_section10_reference_catalog(character_id)
+    return {
+        "character_id": catalog.get("character_id"),
+        "schema_version": catalog.get("schema_version"),
+        "latest_approved_run_id": catalog.get("latest_approved_run_id"),
+        "reference_count": len(catalog.get("references") or []),
+        "baseline_pass": bool((catalog.get("baseline_report") or {}).get("pass")),
+        "section10_complete": bool(catalog.get("section10_complete")),
+    }
+
 """
 ---
 
@@ -4933,6 +5127,12 @@ Includes:
 - Orthographic-like views
 - Camera angle sweeps
 - Optional dramatic lighting
+
+**Section 10 → 11 manifest contract (minimal):**
+- Each Section 10 run stores a normalized `references` array with: `file`, `sha256`, `view_label`, `lighting_label`, `camera_label`, optional `pose_label`, and `is_neutral_baseline`.
+- Use `get_section10_reference_catalog(character_id)` to fetch the latest approved reference catalog.
+- Strict baseline requirement before Section 10 completion: neutral studio + orthographic-like `front`/`side`/`back` must all be present.
+- `section10_complete` is the status gate consumed by Section 11 export.
 
 ---
 

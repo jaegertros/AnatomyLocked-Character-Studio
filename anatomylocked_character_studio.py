@@ -3098,6 +3098,7 @@ def initialize_body_region_map(
     pose_reference: str | None = None,
     image_reference: str | None = None,
 ) -> dict:
+    """Initialize (or reset) the Section 6 `body_region_map` schema for a character."""
     record = load_character_record(character_id)
     existing_map = record.get("body_region_map")
 
@@ -3120,6 +3121,7 @@ def initialize_body_region_map(
 
 
 def register_body_region_mask_paths(character_id: str, region_masks: dict[str, str], *, validate_existing: bool = True) -> dict:
+    """Register or update per-region mask paths and metadata in the Section 6 map."""
     record = load_character_record(character_id)
     body_region_map = ensure_body_region_map(character_id)
     regions = body_region_map.get("regions", {})
@@ -3296,6 +3298,7 @@ def validate_body_region_map(character_id: str) -> dict:
 
 
 def validate_section6_readiness(character_id: str, *, required_region_set: list[str]) -> dict:
+    """Validate Section 6 readiness for Section 7 using a required region gate."""
     validation_result = validate_body_region_map(character_id)
     errors = list(validation_result.get("errors", []))
     details = validation_result.setdefault("details", {})
@@ -3345,7 +3348,7 @@ def print_section6_region_completion_table(character_id: str) -> None:
         print(f"{region_id} | {mask_exists} | {frozen_flag}")
 
 
-# Section 6 workflow cell 1 — Input/config
+# Section 6 workflow cell 1 — Input/config (minimal invocation example)
 section6_character_id = identity_lock_character_id
 section6_source = "notebook.section6"
 section6_pose_reference = None  # optional: e.g., "neutral_a_pose"
@@ -3365,7 +3368,7 @@ print(json.dumps({
     "reset_body_region_map": section6_reset_body_region_map,
 }, indent=2))
 
-# Section 6 workflow cell 2 — Initialize/reset body_region_map
+# Section 6 workflow cell 2 — Initialize/reset body_region_map (minimal invocation example)
 body_region_map = initialize_body_region_map(
     section6_character_id,
     reset_existing=section6_reset_body_region_map,
@@ -3376,7 +3379,7 @@ body_region_map = initialize_body_region_map(
 print("Section 6 body_region_map initialized.")
 print(json.dumps({"schema_version": body_region_map.get("schema_version"), "region_count": len(body_region_map.get("regions", {}))}, indent=2))
 
-# Section 6 workflow cell 3 — Register/update mask paths per region
+# Section 6 workflow cell 3 — Register/update mask paths per region (minimal invocation example)
 section6_region_masks = {
     # "head": "/path/to/head_mask.png",
     # "chest": "/path/to/chest_mask.png",
@@ -3391,7 +3394,7 @@ if section6_region_masks:
 else:
     print("No region masks registered in this run. Update section6_region_masks and re-run this cell.")
 
-# Section 6 workflow cell 4 — Readiness validation gate before Section 7
+# Section 6 workflow cell 4 — Readiness validation gate before Section 7 (minimal invocation example)
 section6_validation_result = validate_section6_readiness(
     section6_character_id,
     required_region_set=section6_required_region_set,

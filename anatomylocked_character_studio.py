@@ -5208,7 +5208,7 @@ def register_section10_reference_run(
         raise ValueError("references must be a non-empty list.")
 
     record = load_character_record(character_id)
-    character_dir = get_character_dir(character_id)
+    character_dir = _character_dir(character_id)
     state = _ensure_section10_state(record, character_id)
 
     normalized_references = [
@@ -5284,6 +5284,183 @@ def get_section10_status(character_id: str) -> dict:
         "reference_count": len(catalog.get("references") or []),
         "baseline_pass": bool((catalog.get("baseline_report") or {}).get("pass")),
         "section10_complete": bool(catalog.get("section10_complete")),
+    }
+
+
+# SECTION 11 — Reference Set Export (consumes Section 10 manifest catalog)
+
+SECTION11_SCHEMA_VERSION = "S11_REFERENCE_EXPORT_V1"
+SECTION11_REQUIRED_STAGE = "section10"
+
+
+def _ensure_section11_state(record: dict, character_id: str) -> dict:
+    state = record.get("section11_reference_export")
+    if not isinstance(state, dict):
+        state = {}
+
+    state.setdefault("schema_version", SECTION11_SCHEMA_VERSION)
+    state.setdefault("character_id", character_id)
+    state.setdefault("runs", [])
+    state.setdefault("latest_run_id", None)
+    state.setdefault("created_at", _utc_now_iso())
+    state["updated_at"] = _utc_now_iso()
+    record["section11_reference_export"] = state
+    return state
+
+
+def _normalize_section11_token(value: str | None, *, default: str = "unspecified") -> str:
+    if not isinstance(value, str) or not value.strip():
+        return default
+    token = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return "".join(ch for ch in token if ch.isalnum() or ch == "_") or default
+
+
+def _resolve_section11_source_path(character_dir: Path, rel_or_abs_path: str) -> Path:
+    source_path = Path(rel_or_abs_path).expanduser()
+    if source_path.is_absolute():
+        return source_path
+    return character_dir / source_path
+
+
+def create_section11_reference_export(
+    character_id: str,
+    *,
+    export_label: str | None = None,
+    notes: str | None = None,
+    include_zip: bool = True,
+    require_section10_complete: bool = True,
+) -> dict:
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+    section11_state = _ensure_section11_state(record, character_id)
+    section10_catalog = get_section10_reference_catalog(character_id)
+
+    if require_section10_complete and not bool(section10_catalog.get("section10_complete")):
+        raise ValueError("Section 10 is not complete. Export is gated until section10_complete is True.")
+
+    references = section10_catalog.get("references") or []
+    if not isinstance(references, list) or not references:
+        raise ValueError("Section 10 catalog does not contain references to export.")
+
+    export_id = f"s11-{uuid.uuid4().hex[:12]}"
+    export_root = character_dir / "exports" / "section11" / export_id
+    export_files_dir = export_root / "references"
+    export_files_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_entries = []
+    for index, reference in enumerate(references, start=1):
+        if not isinstance(reference, dict):
+            continue
+
+        source_rel = str(reference.get("file") or "")
+        if not source_rel:
+            raise ValueError(f"Section 10 reference at index {index - 1} is missing file path.")
+
+        source_path = _resolve_section11_source_path(character_dir, source_rel)
+        if not source_path.exists():
+            raise FileNotFoundError(f"Section 10 reference file not found: {source_path}")
+
+        view_label = _normalize_section11_token(reference.get("view_label"))
+        lighting_label = _normalize_section11_token(reference.get("lighting_label"))
+        camera_label = _normalize_section11_token(reference.get("camera_label"))
+        pose_label = _normalize_section11_token(reference.get("pose_label"), default="")
+
+        parts = [f"{index:03d}", view_label, lighting_label, camera_label]
+        if pose_label:
+            parts.append(pose_label)
+
+        extension = source_path.suffix.lower() or ".png"
+        export_name = "__".join(parts) + extension
+        export_path = export_files_dir / export_name
+        shutil.copy2(source_path, export_path)
+
+        source_sha = (reference.get("sha256") or "").strip() or _sha256_file(source_path)
+        export_sha = _sha256_file(export_path)
+        manifest_entries.append({
+            "index": index,
+            "source_file": source_rel,
+            "source_sha256": source_sha,
+            "export_file": (Path("references") / export_name).as_posix(),
+            "export_sha256": export_sha,
+            "view_label": view_label,
+            "lighting_label": lighting_label,
+            "camera_label": camera_label,
+            "pose_label": pose_label,
+            "is_neutral_baseline": bool(reference.get("is_neutral_baseline")),
+        })
+
+    manifest = {
+        "schema_version": SECTION11_SCHEMA_VERSION,
+        "section": 11,
+        "character_id": character_id,
+        "required_stage": SECTION11_REQUIRED_STAGE,
+        "export_id": export_id,
+        "created_at": _utc_now_iso(),
+        "export_label": (export_label or "").strip() or None,
+        "notes": (notes or "").strip() or None,
+        "source": {
+            "section10_complete": bool(section10_catalog.get("section10_complete")),
+            "section10_schema_version": section10_catalog.get("schema_version"),
+            "section10_run_id": section10_catalog.get("latest_approved_run_id"),
+            "baseline_report": section10_catalog.get("baseline_report") or {},
+            "reference_count": len(manifest_entries),
+        },
+        "references": manifest_entries,
+        "artifacts": {
+            "export_root": export_root.relative_to(character_dir).as_posix(),
+            "manifest_file": (export_root / "section11_manifest.json").relative_to(character_dir).as_posix(),
+            "archive_file": None,
+        },
+    }
+
+    manifest_path = export_root / "section11_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    archive_rel = None
+    if include_zip:
+        archive_path = Path(shutil.make_archive(str(export_root), "zip", root_dir=export_root))
+        archive_rel = archive_path.relative_to(character_dir).as_posix()
+        manifest["artifacts"]["archive_file"] = archive_rel
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    run_entry = {
+        "run_id": export_id,
+        "timestamp": manifest["created_at"],
+        "manifest_file": manifest["artifacts"]["manifest_file"],
+        "archive_file": archive_rel,
+        "reference_count": len(manifest_entries),
+        "source_section10_run_id": section10_catalog.get("latest_approved_run_id"),
+    }
+
+    runs = section11_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    runs.append(run_entry)
+    section11_state["runs"] = runs
+    section11_state["latest_run_id"] = export_id
+    section11_state["updated_at"] = _utc_now_iso()
+    record["section11_reference_export"] = section11_state
+    save_character_record(character_id, record)
+
+    return manifest
+
+
+def get_section11_export_status(character_id: str) -> dict:
+    record = load_character_record(character_id)
+    section11_state = _ensure_section11_state(record, character_id)
+    runs = section11_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    latest_run = runs[-1] if runs and isinstance(runs[-1], dict) else {}
+    save_character_record(character_id, record)
+    return {
+        "character_id": character_id,
+        "schema_version": section11_state.get("schema_version"),
+        "run_count": len(runs),
+        "latest_run_id": section11_state.get("latest_run_id"),
+        "latest_manifest_file": latest_run.get("manifest_file"),
+        "latest_archive_file": latest_run.get("archive_file"),
+        "latest_reference_count": int(latest_run.get("reference_count") or 0),
     }
 
 """

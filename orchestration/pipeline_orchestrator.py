@@ -313,10 +313,24 @@ class AnatomyLockedPipelineOrchestrator:
         node_overrides: dict[str | int, dict[str, Any]] | None = None,
         timeout_seconds: int = 1200,
     ) -> ComfyRunResult:
-        workflow = self._load_workflow("phase5_reference_variants.json")
+        """Backward-compatible wrapper for the Section 10 reference views stage."""
+        return self.run_phase5_section10_reference_views(
+            character_id=character_id,
+            node_overrides=node_overrides,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def run_phase5_section10_reference_views(
+        self,
+        *,
+        character_id: str,
+        node_overrides: dict[str | int, dict[str, Any]] | None = None,
+        timeout_seconds: int = 1200,
+    ) -> ComfyRunResult:
+        workflow = self._load_workflow("section10_reference_views.json")
         run = self.comfy.run_workflow(
             workflow=workflow,
-            stage="phase5_reference_variants",
+            stage="section10_reference_views",
             node_overrides=node_overrides,
             timeout_seconds=timeout_seconds,
         )

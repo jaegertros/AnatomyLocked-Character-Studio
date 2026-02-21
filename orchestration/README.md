@@ -10,9 +10,19 @@ This folder provides the first implementation step for a modular ComfyUI pipelin
 - Stage wrappers for existing workflows:
   - `OtherSetups/phase1_exploration.json`
   - `OtherSetups/phase2_identity_lock.json`
-    - `OtherSetups/phase3_regional_refinement_inpaint.json`
-    - `OtherSetups/phase4_canonical_finalization.json`
-    - `OtherSetups/phase5_reference_variants.json`
+  - `OtherSetups/phase3_regional_refinement_inpaint.json`
+  - `OtherSetups/phase4_canonical_finalization.json`
+  - `OtherSetups/section10_reference_views.json` (Section 10 alias of Phase 5 reference variants)
+
+## Phase ↔ section mapping
+
+Comfy workflow filenames remain phase-oriented, while notebook implementation status is section-oriented.
+
+- Phase 1 → Section 3 (exploration)
+- Phase 2 → Section 5 (identity lock guidance)
+- Phase 3 → Section 7 (regional refinement)
+- Phase 4 → Section 8 (canonical finalization)
+- Phase 5 → Section 10 (lighting, camera, and reference views)
 
 ## Why this exists
 
@@ -61,8 +71,13 @@ phase4_run = orchestrator.run_phase4_canonical_finalization(
     character_id="CH-0001",
 )
 
-phase5_run = orchestrator.run_phase5_reference_variants(
+section10_run = orchestrator.run_phase5_section10_reference_views(
     character_id="CH-0001",
+    node_overrides={
+        2: {"widgets_values": {0: "studio softbox, neutral gray seamless"}},
+        5: {"widgets_values": {0: "50mm lens, eye-level, orthographic style"}},
+        7: {"widgets_values": {0: "front|three-quarter-left|profile-right"}},
+    },
 )
 
 print(
@@ -70,7 +85,7 @@ print(
     phase2_run.prompt_id,
     phase3_run.prompt_id,
     phase4_run.prompt_id,
-    phase5_run.prompt_id,
+    section10_run.prompt_id,
 )
 ```
 

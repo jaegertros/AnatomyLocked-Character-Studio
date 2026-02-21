@@ -3473,6 +3473,302 @@ print(section6_handoff_result["message"])
 # Section 6 workflow cell 5 — Compact completion summary table
 print_section6_region_completion_table(section6_character_id)
 
+
+# SECTION 7 — Regional Refinement Mode (Distinctive Anchor: S7_REGIONAL_REFINEMENT_PIPELINE_V1)
+SECTION7_REFINEMENT_SCHEMA_VERSION = "section7.regional_refinement.v1"
+
+
+def _ensure_section7_refinement_state(record: dict, character_id: str) -> dict:
+    section7_state = record.get("section7_refinement")
+    if not isinstance(section7_state, dict):
+        section7_state = {}
+
+    section7_state.setdefault("schema_version", SECTION7_REFINEMENT_SCHEMA_VERSION)
+    section7_state.setdefault("character_id", character_id)
+    section7_state.setdefault("active_region", None)
+    section7_state.setdefault("completed_regions", [])
+    section7_state.setdefault("history", [])
+    section7_state.setdefault("created_at", _utc_now_iso())
+    section7_state["updated_at"] = _utc_now_iso()
+    record["section7_refinement"] = section7_state
+    return section7_state
+
+
+def lock_entire_body_for_refinement(
+    character_id: str,
+    *,
+    source_operation_tag: str = "section7.lock_entire_body",
+) -> dict:
+    record = load_character_record(character_id)
+    body_region_map = ensure_body_region_map(character_id)
+    regions = body_region_map.get("regions", {})
+
+    for region_id, payload in regions.items():
+        if not isinstance(payload, dict):
+            continue
+        payload["is_locked"] = True
+        payload["last_edited_at"] = _utc_now_iso()
+        payload["source_operation_tag"] = source_operation_tag
+        regions[region_id] = payload
+
+    body_region_map["regions"] = regions
+    body_region_map["updated_at"] = _utc_now_iso()
+    record["body_region_map"] = body_region_map
+
+    section7_state = _ensure_section7_refinement_state(record, character_id)
+    section7_state["active_region"] = None
+    section7_state["history"].append({
+        "timestamp": _utc_now_iso(),
+        "event": "lock_entire_body",
+        "source_operation_tag": source_operation_tag,
+    })
+    section7_state["updated_at"] = _utc_now_iso()
+    record["section7_refinement"] = section7_state
+
+    save_character_record(character_id, record)
+    return {"character_id": character_id, "locked_region_count": len(regions)}
+
+
+def get_next_unrefined_region(character_id: str, preferred_order: list[str] | None = None) -> str | None:
+    body_region_map = ensure_body_region_map(character_id)
+    regions = body_region_map.get("regions", {})
+    order = list(preferred_order or SECTION6_REQUIRED_REGION_KEYS)
+    for region_id in order:
+        payload = regions.get(region_id)
+        if not isinstance(payload, dict):
+            continue
+        if bool(payload.get("is_frozen")):
+            continue
+        return region_id
+    return None
+
+
+def unlock_region_for_refinement(
+    character_id: str,
+    region_id: str,
+    *,
+    source_operation_tag: str = "section7.unlock_region",
+) -> dict:
+    record = load_character_record(character_id)
+    body_region_map = ensure_body_region_map(character_id)
+    regions = body_region_map.get("regions", {})
+
+    if region_id not in regions or not isinstance(regions[region_id], dict):
+        raise KeyError(f"Unknown region_id for Section 7 unlock: {region_id}")
+    if bool(regions[region_id].get("is_frozen")):
+        raise RuntimeError(f"Region '{region_id}' is frozen and cannot be unlocked.")
+
+    for candidate_region_id, payload in regions.items():
+        if not isinstance(payload, dict):
+            continue
+        payload["is_locked"] = candidate_region_id != region_id
+        payload["last_edited_at"] = _utc_now_iso()
+        payload["source_operation_tag"] = source_operation_tag
+        regions[candidate_region_id] = payload
+
+    body_region_map["regions"] = regions
+    body_region_map["updated_at"] = _utc_now_iso()
+    record["body_region_map"] = body_region_map
+
+    section7_state = _ensure_section7_refinement_state(record, character_id)
+    section7_state["active_region"] = region_id
+    section7_state["history"].append({
+        "timestamp": _utc_now_iso(),
+        "event": "unlock_region",
+        "region_id": region_id,
+        "source_operation_tag": source_operation_tag,
+    })
+    section7_state["updated_at"] = _utc_now_iso()
+    record["section7_refinement"] = section7_state
+
+    save_character_record(character_id, record)
+    return {"character_id": character_id, "active_region": region_id}
+
+
+def record_region_refinement_adjustment(
+    character_id: str,
+    region_id: str,
+    *,
+    adjustment_summary: str,
+    bounds_check: str,
+    source_operation_tag: str = "section7.record_adjustment",
+) -> dict:
+    if not adjustment_summary.strip():
+        raise ValueError("adjustment_summary must be non-empty.")
+    if not bounds_check.strip():
+        raise ValueError("bounds_check must be non-empty.")
+
+    record = load_character_record(character_id)
+    body_region_map = ensure_body_region_map(character_id)
+    regions = body_region_map.get("regions", {})
+    payload = regions.get(region_id)
+    if not isinstance(payload, dict):
+        raise KeyError(f"Unknown region_id for Section 7 adjustment: {region_id}")
+    if bool(payload.get("is_locked")):
+        raise RuntimeError(f"Region '{region_id}' is locked. Unlock it before recording adjustment.")
+
+    adjustments = payload.get("refinement_adjustments")
+    if not isinstance(adjustments, list):
+        adjustments = []
+    adjustment_entry = {
+        "timestamp": _utc_now_iso(),
+        "summary": adjustment_summary.strip(),
+        "bounds_check": bounds_check.strip(),
+        "source_operation_tag": source_operation_tag,
+    }
+    adjustments.append(adjustment_entry)
+    payload["refinement_adjustments"] = adjustments
+    payload["last_edited_at"] = _utc_now_iso()
+    payload["source_operation_tag"] = source_operation_tag
+    regions[region_id] = payload
+
+    body_region_map["regions"] = regions
+    body_region_map["updated_at"] = _utc_now_iso()
+    record["body_region_map"] = body_region_map
+
+    section7_state = _ensure_section7_refinement_state(record, character_id)
+    section7_state["active_region"] = region_id
+    section7_state["history"].append({
+        "timestamp": _utc_now_iso(),
+        "event": "record_adjustment",
+        "region_id": region_id,
+        "bounds_check": bounds_check.strip(),
+        "source_operation_tag": source_operation_tag,
+    })
+    section7_state["updated_at"] = _utc_now_iso()
+    record["section7_refinement"] = section7_state
+
+    save_character_record(character_id, record)
+    return adjustment_entry
+
+
+def freeze_refined_region(
+    character_id: str,
+    region_id: str,
+    *,
+    source_operation_tag: str = "section7.freeze_region",
+) -> dict:
+    record = load_character_record(character_id)
+    body_region_map = ensure_body_region_map(character_id)
+    regions = body_region_map.get("regions", {})
+    payload = regions.get(region_id)
+    if not isinstance(payload, dict):
+        raise KeyError(f"Unknown region_id for Section 7 freeze: {region_id}")
+
+    payload["is_locked"] = True
+    payload["is_frozen"] = True
+    payload["last_edited_at"] = _utc_now_iso()
+    payload["source_operation_tag"] = source_operation_tag
+    regions[region_id] = payload
+
+    body_region_map["regions"] = regions
+    body_region_map["updated_at"] = _utc_now_iso()
+    record["body_region_map"] = body_region_map
+
+    section7_state = _ensure_section7_refinement_state(record, character_id)
+    completed_regions = section7_state.get("completed_regions")
+    if not isinstance(completed_regions, list):
+        completed_regions = []
+    if region_id not in completed_regions:
+        completed_regions.append(region_id)
+    section7_state["completed_regions"] = completed_regions
+    section7_state["active_region"] = None
+    section7_state["history"].append({
+        "timestamp": _utc_now_iso(),
+        "event": "freeze_region",
+        "region_id": region_id,
+        "source_operation_tag": source_operation_tag,
+    })
+    section7_state["updated_at"] = _utc_now_iso()
+    record["section7_refinement"] = section7_state
+
+    save_character_record(character_id, record)
+    return {"character_id": character_id, "frozen_region": region_id, "completed_regions": completed_regions}
+
+
+def get_section7_refinement_status(character_id: str, preferred_order: list[str] | None = None) -> dict:
+    record = load_character_record(character_id)
+    body_region_map = ensure_body_region_map(character_id)
+    regions = body_region_map.get("regions", {})
+    section7_state = _ensure_section7_refinement_state(record, character_id)
+
+    order = list(preferred_order or SECTION6_REQUIRED_REGION_KEYS)
+    next_region = get_next_unrefined_region(character_id, preferred_order=order)
+    frozen_regions = [region_id for region_id in order if bool((regions.get(region_id) or {}).get("is_frozen"))]
+
+    status = {
+        "character_id": character_id,
+        "active_region": section7_state.get("active_region"),
+        "completed_regions": list(section7_state.get("completed_regions") or []),
+        "frozen_region_count": len(frozen_regions),
+        "remaining_region_count": max(len(order) - len(frozen_regions), 0),
+        "next_region": next_region,
+        "workflow_complete": next_region is None,
+    }
+    save_character_record(character_id, record)
+    return status
+
+
+# Section 7 workflow cell 1 — Input/config (minimal invocation example)
+section7_character_id = section6_character_id
+section7_preferred_order = list(SECTION6_REQUIRED_REGION_KEYS)
+section7_adjustment_summary = ""  # e.g., "Adjusted clavicle width +2% for shoulder alignment"
+section7_bounds_check = ""  # e.g., "Within anatomical reference bounds"
+
+print("Section 7 config:")
+print(json.dumps({
+    "character_id": section7_character_id,
+    "preferred_order": section7_preferred_order,
+    "adjustment_summary": section7_adjustment_summary,
+    "bounds_check": section7_bounds_check,
+}, indent=2))
+
+# Section 7 workflow cell 2 — Lock entire body
+section7_lock_result = lock_entire_body_for_refinement(section7_character_id)
+print(json.dumps(section7_lock_result, indent=2))
+
+# Section 7 workflow cell 3 — Unlock next region
+section7_next_region = get_next_unrefined_region(
+    section7_character_id,
+    preferred_order=section7_preferred_order,
+)
+if section7_next_region is None:
+    print("All Section 7 regions are frozen. No region available to unlock.")
+else:
+    section7_unlock_result = unlock_region_for_refinement(
+        section7_character_id,
+        section7_next_region,
+    )
+    print(json.dumps(section7_unlock_result, indent=2))
+
+# Section 7 workflow cell 4 — Record bounded adjustment and freeze region
+if section7_next_region and section7_adjustment_summary and section7_bounds_check:
+    section7_adjustment = record_region_refinement_adjustment(
+        section7_character_id,
+        section7_next_region,
+        adjustment_summary=section7_adjustment_summary,
+        bounds_check=section7_bounds_check,
+    )
+    print("Recorded adjustment:")
+    print(json.dumps(section7_adjustment, indent=2))
+
+    section7_freeze_result = freeze_refined_region(
+        section7_character_id,
+        section7_next_region,
+    )
+    print("Frozen region:")
+    print(json.dumps(section7_freeze_result, indent=2))
+else:
+    print("Set section7_adjustment_summary and section7_bounds_check to record an adjustment and freeze the unlocked region.")
+
+# Section 7 workflow cell 5 — Move to next region (status preview)
+section7_status = get_section7_refinement_status(
+    section7_character_id,
+    preferred_order=section7_preferred_order,
+)
+print("Section 7 status:")
+print(json.dumps(section7_status, indent=2))
+
 """
 ---
 

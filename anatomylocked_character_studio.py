@@ -4731,57 +4731,72 @@ def get_section9_pose_deformation_status(character_id: str) -> dict:
     return status
 
 
+def get_section9_pose_status(character_id: str) -> dict:
+    record = load_character_record(character_id)
+    section9_state = _ensure_section9_pose_state(record, character_id)
+
+    runs = section9_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+
+    gate_counts = {"PASS": 0, "PASS_WITH_WARNINGS": 0, "FAIL": 0}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        gate_status = str(((run.get("gate") or {}).get("status") or "")).upper()
+        if gate_status in gate_counts:
+            gate_counts[gate_status] += 1
+
+    latest_run = runs[-1] if runs and isinstance(runs[-1], dict) else {}
+    latest_gate_status = (latest_run.get("gate") or {}).get("status")
+    latest_pose_label = latest_run.get("pose_label")
+
+    status = {
+        "character_id": character_id,
+        "total_runs": len(runs),
+        "pass_count": gate_counts["PASS"],
+        "warn_count": gate_counts["PASS_WITH_WARNINGS"],
+        "fail_count": gate_counts["FAIL"],
+        "latest_run_id": latest_run.get("run_id"),
+        "latest_pose_label": latest_pose_label,
+        "latest_gate_status": latest_gate_status,
+    }
+    save_character_record(character_id, record)
+    return status
+
+
 # Section 9 workflow cell 1 — Input/config (minimal invocation example)
 section9_character_id = section8_character_id
-section9_pose_id = ""  # e.g., "pose-001"
-section9_pose_label = ""  # one of: standing, sitting, walking, reaching, twisting, bending, flexing
-section9_source_canonical_image = ""  # optional override path; default uses Section 8 latest canonical
-section9_deformation_policy = {
-    "allowed_regions": ["arms", "legs", "spine"],
-    "metrics": {"max_limb_ratio_delta": 0.08, "max_torso_warp": 0.05},
+section9_canonical_image_path = ""  # required path to canonical frozen image
+section9_pose_spec = {
+    "pose_id": "",  # e.g., "pose-001"
+    "pose_label": "",  # e.g., standing/sitting/walking/reaching/twisting/bending/flexing
 }
-section9_identity_policy = {"strict_lock_checks": True}
-section9_outputs = []  # e.g., [{"image_path": "/content/pose_walk.png", "metadata": {"sampler": "dpmpp"}}]
+section9_notes = ""
 
 print("Section 9 config:")
 print(json.dumps({
     "character_id": section9_character_id,
-    "pose_id": section9_pose_id,
-    "pose_label": section9_pose_label,
-    "source_canonical_image": section9_source_canonical_image,
-    "deformation_policy": section9_deformation_policy,
-    "identity_policy": section9_identity_policy,
-    "outputs": section9_outputs,
+    "canonical_image_path": section9_canonical_image_path,
+    "pose_spec": section9_pose_spec,
+    "notes": section9_notes,
 }, indent=2))
 
-# Section 9 workflow cell 2 — Validate/create pose deformation run (guarded invocation)
-if section9_pose_id and section9_pose_label:
-    section9_request_validation = validate_section9_pose_request(
+# Section 9 workflow cell 2 — Run pose deformation generation (guarded invocation)
+if section9_canonical_image_path and isinstance(section9_pose_spec, dict) and section9_pose_spec.get("pose_label"):
+    section9_run_result = run_pose_deformation_generation(
         section9_character_id,
-        pose_id=section9_pose_id,
-        pose_label=section9_pose_label,
-        source_canonical_image=section9_source_canonical_image or None,
+        section9_canonical_image_path,
+        section9_pose_spec,
+        notes=section9_notes or None,
     )
-    print("Section 9 request validation:")
-    print(json.dumps(section9_request_validation, indent=2))
-
-    if section9_request_validation["pass"]:
-        section9_run_entry = create_section9_pose_deformation_run(
-            section9_character_id,
-            pose_id=section9_pose_id,
-            pose_label=section9_pose_label,
-            source_canonical_image=section9_source_canonical_image or None,
-            deformation_policy=section9_deformation_policy,
-            identity_policy=section9_identity_policy,
-            outputs=section9_outputs,
-        )
-        print("Section 9 run entry:")
-        print(json.dumps(section9_run_entry, indent=2))
+    print("Section 9 run result:")
+    print(json.dumps(section9_run_result, indent=2))
 else:
-    print("Set section9_pose_id and section9_pose_label to create a Section 9 run.")
+    print("Set section9_canonical_image_path and section9_pose_spec['pose_label'] to run Section 9.")
 
 # Section 9 workflow cell 3 — Status preview
-section9_status = get_section9_pose_deformation_status(section9_character_id)
+section9_status = get_section9_pose_status(section9_character_id)
 print("Section 9 status:")
 print(json.dumps(section9_status, indent=2))
 

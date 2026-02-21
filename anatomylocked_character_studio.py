@@ -3709,6 +3709,255 @@ def get_section7_refinement_status(character_id: str, preferred_order: list[str]
     return status
 
 
+SECTION7_DEFAULT_REGION_SCOPE = ["head", "shoulders", "chest"]
+SECTION7_DEFAULT_QUALITY_THRESHOLDS = {
+    "identity": 1.0,
+    "coverage": 1.0,
+    "provenance": 1.0,
+}
+
+
+def load_region_map(character_id: str) -> dict:
+    body_region_map = ensure_body_region_map(character_id)
+    validation = validate_section6_readiness(character_id)
+    required_regions = validation.get("required_region_set") or list(SECTION7_DEFAULT_REGION_SCOPE)
+    regions = body_region_map.get("regions", {})
+    scoped_regions = {
+        region_id: regions[region_id]
+        for region_id in required_regions
+        if isinstance(regions.get(region_id), dict)
+    }
+    return {
+        "character_id": character_id,
+        "schema_version": body_region_map.get("schema_version"),
+        "mask_root": body_region_map.get("mask_root", SECTION6_REGION_MASK_SUBDIR),
+        "required_regions": required_regions,
+        "regions": scoped_regions,
+    }
+
+
+def validate_region_map(region_map: dict, masks_dir: str | Path) -> dict:
+    masks_root = Path(masks_dir).expanduser()
+    errors = []
+    warnings = []
+    checked_regions = []
+    regions = region_map.get("regions", {}) if isinstance(region_map, dict) else {}
+
+    for region_id in region_map.get("required_regions", []):
+        payload = regions.get(region_id)
+        if not isinstance(payload, dict):
+            errors.append(f"Missing region payload: {region_id}")
+            continue
+
+        mask_path = payload.get("mask_path")
+        if not isinstance(mask_path, str) or not mask_path.strip():
+            errors.append(f"Missing mask_path for region: {region_id}")
+            continue
+
+        resolved_mask = (masks_root / mask_path).resolve() if not Path(mask_path).is_absolute() else Path(mask_path).resolve()
+        if not resolved_mask.exists():
+            errors.append(f"Mask does not exist for region '{region_id}': {resolved_mask}")
+            continue
+
+        checked_regions.append(region_id)
+        metadata = payload.get("mask_metadata")
+        if not isinstance(metadata, dict):
+            warnings.append(f"mask_metadata missing for region: {region_id}")
+
+    return {
+        "pass": not errors,
+        "checked_region_count": len(checked_regions),
+        "checked_regions": checked_regions,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def run_regional_refinement(character_id: str, input_image_path: str, config: dict | None = None) -> dict:
+    config = dict(config or {})
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+    region_map = load_region_map(character_id)
+    region_validation = validate_region_map(region_map, character_dir)
+    if not region_validation["pass"]:
+        raise RuntimeError(f"Region map validation failed: {region_validation['errors']}")
+
+    source = Path(input_image_path).expanduser()
+    if not source.exists():
+        raise FileNotFoundError(f"Regional refinement input image not found: {source}")
+
+    run_id = f"rr-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+    output_name = f"{run_id}_refined{source.suffix.lower() or '.png'}"
+    output_rel, output_sha = _copy_to_character_subdir(
+        character_dir,
+        source,
+        "regional_refinement/candidates",
+        output_name,
+    )
+
+    regional_refinement = record.get("regional_refinement")
+    if not isinstance(regional_refinement, dict):
+        regional_refinement = {
+            "schema_version": "section7.regional_refinement_plan.v1",
+            "created_at": _utc_now_iso(),
+            "runs": [],
+            "promotions": [],
+        }
+
+    run_entry = {
+        "run_id": run_id,
+        "created_at": _utc_now_iso(),
+        "input_image_path": str(source.resolve()),
+        "output_image": {
+            "path": output_rel,
+            "sha256": output_sha,
+        },
+        "config": config,
+        "required_regions": list(region_map.get("required_regions") or []),
+        "processed_regions": list(region_validation.get("checked_regions") or []),
+        "provenance": {
+            "operation": "run_regional_refinement",
+            "source_operation_tag": config.get("source_operation_tag", "section7.run_regional_refinement"),
+        },
+    }
+    regional_refinement["runs"].append(run_entry)
+    regional_refinement["updated_at"] = _utc_now_iso()
+    record["regional_refinement"] = regional_refinement
+    save_character_record(character_id, record)
+    return run_entry
+
+
+def validate_regional_refinement(character_id: str, refined_image_path: str, strict: bool = True) -> dict:
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+    region_map = load_region_map(character_id)
+    region_validation = validate_region_map(region_map, character_dir)
+    identity_validation = validate_identity_lock(character_id, refined_image_path)
+
+    gate_a_identity = bool(identity_validation.get("pass"))
+    required_regions = list(region_map.get("required_regions") or [])
+    processed_regions = list(region_validation.get("checked_regions") or [])
+    gate_b_regions = set(required_regions).issubset(set(processed_regions))
+    provenance_ok = False
+    regional_refinement = record.get("regional_refinement")
+    if isinstance(regional_refinement, dict):
+        runs = regional_refinement.get("runs")
+        if isinstance(runs, list) and runs:
+            latest = runs[-1]
+            provenance = latest.get("provenance") if isinstance(latest, dict) else None
+            provenance_ok = isinstance(provenance, dict) and bool(provenance.get("operation")) and bool(provenance.get("source_operation_tag"))
+
+    quality_score = 1.0 if region_validation["pass"] else 0.0
+    threshold = float(SECTION7_DEFAULT_QUALITY_THRESHOLDS["coverage"])
+    gate_c_quality = quality_score >= threshold
+    gate_d_provenance = provenance_ok
+
+    failures = []
+    warnings = []
+    if not gate_a_identity:
+        failures.append("Gate A failed: identity lock validation did not pass.")
+    if not gate_b_regions:
+        failures.append("Gate B failed: required regions are not fully processed.")
+    if not gate_c_quality:
+        message = "Gate C failed: regional quality checks are below threshold."
+        if strict:
+            failures.append(message)
+        else:
+            warnings.append(message)
+    if not gate_d_provenance:
+        failures.append("Gate D failed: provenance is incomplete.")
+
+    summary_status = "PASS"
+    if failures:
+        summary_status = "FAIL"
+    elif warnings:
+        summary_status = "PASS_WITH_WARNINGS"
+
+    report = {
+        "character_id": character_id,
+        "timestamp": _utc_now_iso(),
+        "strict": strict,
+        "summary_status": summary_status,
+        "gates": {
+            "gate_a_identity": gate_a_identity,
+            "gate_b_required_regions": gate_b_regions,
+            "gate_c_quality": gate_c_quality,
+            "gate_d_provenance": gate_d_provenance,
+        },
+        "required_regions": required_regions,
+        "processed_regions": processed_regions,
+        "identity_validation": identity_validation,
+        "region_map_validation": region_validation,
+        "failures": failures,
+        "warnings": warnings,
+    }
+
+    regional_refinement = record.get("regional_refinement")
+    if not isinstance(regional_refinement, dict):
+        regional_refinement = {
+            "schema_version": "section7.regional_refinement_plan.v1",
+            "created_at": _utc_now_iso(),
+            "runs": [],
+            "promotions": [],
+        }
+    reports = regional_refinement.get("validation_reports")
+    if not isinstance(reports, list):
+        reports = []
+    reports.append(report)
+    regional_refinement["validation_reports"] = reports
+    regional_refinement["updated_at"] = _utc_now_iso()
+    record["regional_refinement"] = regional_refinement
+    save_character_record(character_id, record)
+    return report
+
+
+def promote_refined_candidate(character_id: str, refined_image_path: str, report: dict) -> dict:
+    if not isinstance(report, dict):
+        raise ValueError("report must be a validation report dictionary.")
+    if report.get("summary_status") not in {"PASS", "PASS_WITH_WARNINGS"}:
+        raise RuntimeError("Refined candidate cannot be promoted because validation did not pass.")
+
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+    source = Path(refined_image_path).expanduser()
+    promoted_name = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_regional_refined{source.suffix.lower() or '.png'}"
+    promoted_rel, promoted_sha = _copy_to_character_subdir(
+        character_dir,
+        source,
+        "regional_refinement/promoted",
+        promoted_name,
+    )
+
+    regional_refinement = record.get("regional_refinement")
+    if not isinstance(regional_refinement, dict):
+        regional_refinement = {
+            "schema_version": "section7.regional_refinement_plan.v1",
+            "created_at": _utc_now_iso(),
+            "runs": [],
+            "promotions": [],
+        }
+    promotions = regional_refinement.get("promotions")
+    if not isinstance(promotions, list):
+        promotions = []
+
+    promotion_entry = {
+        "timestamp": _utc_now_iso(),
+        "promoted_image": {
+            "path": promoted_rel,
+            "sha256": promoted_sha,
+        },
+        "validation_summary_status": report.get("summary_status"),
+        "report_timestamp": report.get("timestamp"),
+    }
+    promotions.append(promotion_entry)
+    regional_refinement["promotions"] = promotions
+    regional_refinement["latest_promoted_image"] = promoted_rel
+    regional_refinement["updated_at"] = _utc_now_iso()
+    record["regional_refinement"] = regional_refinement
+    save_character_record(character_id, record)
+    return promotion_entry
+
+
 # Section 7 workflow cell 1 — Input/config (minimal invocation example)
 section7_character_id = section6_character_id
 section7_preferred_order = list(SECTION6_REQUIRED_REGION_KEYS)

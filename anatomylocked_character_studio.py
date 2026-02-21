@@ -4238,6 +4238,15 @@ print(json.dumps(section8_status, indent=2))
 # SECTION 9 — Pose & Deformation Generation (Distinctive Anchor: S9_POSE_DEFORMATION_SCHEMA_V1)
 SECTION9_SCHEMA_VERSION = "section9.pose_deformation.v1"
 SECTION9_REQUIRED_STAGE = "section8"
+SECTION9_ALLOWED_POSE_LABELS = {
+    "standing",
+    "sitting",
+    "walking",
+    "reaching",
+    "twisting",
+    "bending",
+    "flexing",
+}
 
 
 def _ensure_section9_pose_state(record: dict, character_id: str) -> dict:
@@ -4268,24 +4277,186 @@ def _assert_section9_lifecycle_gate(record: dict) -> None:
         )
 
 
+def _resolve_section9_canonical_source(record: dict, character_dir: Path, source_canonical_image: str | None = None) -> tuple[str | None, Path | None]:
+    if source_canonical_image:
+        source_path = Path(source_canonical_image).expanduser()
+        if source_path.is_absolute():
+            return str(source_path), source_path
+        return source_canonical_image, (character_dir / source_path)
+
+    section8_state = record.get("section8_canonical_finalization")
+    if isinstance(section8_state, dict):
+        latest_rel = section8_state.get("latest_canonical_image")
+        if isinstance(latest_rel, str) and latest_rel.strip():
+            return latest_rel, (character_dir / latest_rel)
+    return None, None
+
+
+def _collect_section9_identity_artifact_issues(identity_lock: dict, character_dir: Path) -> list[str]:
+    issues = []
+
+    references = identity_lock.get("reference_images")
+    if not isinstance(references, list) or not references:
+        issues.append("identity_lock.reference_images is missing or empty.")
+    else:
+        for idx, reference in enumerate(references, start=1):
+            rel_path = reference.get("file") if isinstance(reference, dict) else None
+            if not isinstance(rel_path, str) or not rel_path.strip():
+                issues.append(f"identity_lock.reference_images[{idx - 1}].file is missing.")
+                continue
+            if not (character_dir / rel_path).exists():
+                issues.append(f"identity lock reference image does not exist: {rel_path}")
+
+    features = ((identity_lock.get("invariants") or {}).get("features") or [])
+    if isinstance(features, list):
+        for idx, feature in enumerate(features, start=1):
+            if not isinstance(feature, dict):
+                issues.append(f"identity_lock.invariants.features[{idx - 1}] must be a dict.")
+                continue
+            mask_file = feature.get("mask_file")
+            if isinstance(mask_file, str) and mask_file.strip() and not (character_dir / mask_file).exists():
+                issues.append(f"identity invariant mask does not exist: {mask_file}")
+
+    return issues
+
+
+def validate_section9_pose_request(
+    character_id: str,
+    *,
+    pose_id: str,
+    pose_label: str,
+    source_canonical_image: str | None = None,
+) -> dict:
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+
+    failures = []
+    warnings = []
+
+    normalized_pose_id = str(pose_id or "").strip()
+    normalized_pose_label = str(pose_label or "").strip().lower()
+    if not normalized_pose_id or not normalized_pose_label:
+        failures.append("Pose definition must include non-empty pose_id and pose_label.")
+    elif normalized_pose_label not in SECTION9_ALLOWED_POSE_LABELS:
+        failures.append(
+            f"pose_label '{pose_label}' is not supported. Allowed labels: {sorted(SECTION9_ALLOWED_POSE_LABELS)}"
+        )
+
+    section8_state = record.get("section8_canonical_finalization")
+    finalizations = section8_state.get("finalizations") if isinstance(section8_state, dict) else None
+    is_finalized = isinstance(finalizations, list) and bool(finalizations)
+    if not is_finalized:
+        failures.append("Section 8 finalized status must be true before Section 9 runs.")
+
+    canonical_rel, canonical_path = _resolve_section9_canonical_source(record, character_dir, source_canonical_image)
+    if canonical_path is None or not canonical_path.exists():
+        failures.append("Canonical source image does not exist for Section 9 pose request.")
+
+    identity_lock = record.get("identity_lock")
+    if not isinstance(identity_lock, dict):
+        failures.append("identity_lock is missing; required identity lock artifacts are unavailable.")
+        identity_artifact_issues = []
+    else:
+        identity_artifact_issues = _collect_section9_identity_artifact_issues(identity_lock, character_dir)
+        failures.extend(identity_artifact_issues)
+
+    return {
+        "character_id": character_id,
+        "timestamp": _utc_now_iso(),
+        "pose_definition": {
+            "pose_id": normalized_pose_id,
+            "pose_label": normalized_pose_label,
+        },
+        "source_canonical_image": canonical_rel,
+        "canonical_source_exists": bool(canonical_path and canonical_path.exists()),
+        "section8_finalized": is_finalized,
+        "identity_artifacts_present": not identity_artifact_issues,
+        "warnings": warnings,
+        "failures": failures,
+        "pass": not failures,
+    }
+
+
 def create_section9_pose_deformation_run(
     character_id: str,
     *,
-    pose_prompt: str,
+    pose_id: str,
+    pose_label: str,
+    source_canonical_image: str | None = None,
+    deformation_policy: dict | None = None,
+    identity_policy: dict | None = None,
+    outputs: list[dict] | None = None,
     source_operation_tag: str = "section9.pose_deformation",
 ) -> dict:
-    if not isinstance(pose_prompt, str) or not pose_prompt.strip():
-        raise ValueError("pose_prompt must be a non-empty string.")
-
     record = load_character_record(character_id)
     _assert_section9_lifecycle_gate(record)
     section9_state = _ensure_section9_pose_state(record, character_id)
 
+    request_validation = validate_section9_pose_request(
+        character_id,
+        pose_id=pose_id,
+        pose_label=pose_label,
+        source_canonical_image=source_canonical_image,
+    )
+    if not request_validation["pass"]:
+        raise RuntimeError(f"Invalid Section 9 pose request: {request_validation['failures']}")
+
+    character_dir = _character_dir(character_id)
+    canonical_rel, canonical_path = _resolve_section9_canonical_source(record, character_dir, source_canonical_image)
+
     run_id = f"s9_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+    outputs_entries = []
+    drift_reasons = []
+    identity_checks = []
+
+    for output in list(outputs or []):
+        if not isinstance(output, dict):
+            continue
+        image_path = output.get("image_path")
+        if not isinstance(image_path, str) or not image_path.strip():
+            continue
+        output_path = Path(image_path).expanduser()
+        output_exists = output_path.exists()
+        output_entry = {
+            "image_path": str(output_path),
+            "hash": _sha256_file(output_path) if output_exists else None,
+            "metadata": dict(output.get("metadata") or {}),
+        }
+        outputs_entries.append(output_entry)
+
+        if output_exists:
+            identity_validation = validate_identity_lock(character_id, str(output_path))
+            identity_checks.append({
+                "image_path": str(output_path),
+                "pass": bool(identity_validation.get("pass")),
+                "drift_reasons": list(identity_validation.get("reasons") or []),
+            })
+            if not identity_validation.get("pass"):
+                drift_reasons.extend(identity_validation.get("reasons") or ["Identity validation failed."])
+        else:
+            reason = f"Output image does not exist: {output_path}"
+            drift_reasons.append(reason)
+            identity_checks.append({
+                "image_path": str(output_path),
+                "pass": False,
+                "drift_reasons": [reason],
+            })
+
     run_entry = {
         "run_id": run_id,
         "timestamp": _utc_now_iso(),
-        "pose_prompt": pose_prompt.strip(),
+        "pose_id": request_validation["pose_definition"]["pose_id"],
+        "pose_label": request_validation["pose_definition"]["pose_label"],
+        "source_canonical_image": canonical_rel,
+        "deformation_policy": dict(deformation_policy or {}),
+        "identity_policy": dict(identity_policy or {"strict_lock_checks": True}),
+        "outputs": outputs_entries,
+        "validation": {
+            "request": request_validation,
+            "identity_pass": all(check.get("pass") for check in identity_checks) if identity_checks else True,
+            "drift_reasons": drift_reasons,
+            "identity_checks": identity_checks,
+        },
         "required_stage": SECTION9_REQUIRED_STAGE,
         "source_operation_tag": source_operation_tag,
     }
@@ -4332,24 +4503,52 @@ def get_section9_pose_deformation_status(character_id: str) -> dict:
 
 # Section 9 workflow cell 1 — Input/config (minimal invocation example)
 section9_character_id = section8_character_id
-section9_pose_prompt = ""  # e.g., "standing contrapposto, left arm raised"
+section9_pose_id = ""  # e.g., "pose-001"
+section9_pose_label = ""  # one of: standing, sitting, walking, reaching, twisting, bending, flexing
+section9_source_canonical_image = ""  # optional override path; default uses Section 8 latest canonical
+section9_deformation_policy = {
+    "allowed_regions": ["arms", "legs", "spine"],
+    "metrics": {"max_limb_ratio_delta": 0.08, "max_torso_warp": 0.05},
+}
+section9_identity_policy = {"strict_lock_checks": True}
+section9_outputs = []  # e.g., [{"image_path": "/content/pose_walk.png", "metadata": {"sampler": "dpmpp"}}]
 
 print("Section 9 config:")
 print(json.dumps({
     "character_id": section9_character_id,
-    "pose_prompt": section9_pose_prompt,
+    "pose_id": section9_pose_id,
+    "pose_label": section9_pose_label,
+    "source_canonical_image": section9_source_canonical_image,
+    "deformation_policy": section9_deformation_policy,
+    "identity_policy": section9_identity_policy,
+    "outputs": section9_outputs,
 }, indent=2))
 
-# Section 9 workflow cell 2 — Create pose deformation run (guarded invocation)
-if section9_pose_prompt:
-    section9_run_entry = create_section9_pose_deformation_run(
+# Section 9 workflow cell 2 — Validate/create pose deformation run (guarded invocation)
+if section9_pose_id and section9_pose_label:
+    section9_request_validation = validate_section9_pose_request(
         section9_character_id,
-        pose_prompt=section9_pose_prompt,
+        pose_id=section9_pose_id,
+        pose_label=section9_pose_label,
+        source_canonical_image=section9_source_canonical_image or None,
     )
-    print("Section 9 run entry:")
-    print(json.dumps(section9_run_entry, indent=2))
+    print("Section 9 request validation:")
+    print(json.dumps(section9_request_validation, indent=2))
+
+    if section9_request_validation["pass"]:
+        section9_run_entry = create_section9_pose_deformation_run(
+            section9_character_id,
+            pose_id=section9_pose_id,
+            pose_label=section9_pose_label,
+            source_canonical_image=section9_source_canonical_image or None,
+            deformation_policy=section9_deformation_policy,
+            identity_policy=section9_identity_policy,
+            outputs=section9_outputs,
+        )
+        print("Section 9 run entry:")
+        print(json.dumps(section9_run_entry, indent=2))
 else:
-    print("Set section9_pose_prompt to create a Section 9 run.")
+    print("Set section9_pose_id and section9_pose_label to create a Section 9 run.")
 
 # Section 9 workflow cell 3 — Status preview
 section9_status = get_section9_pose_deformation_status(section9_character_id)

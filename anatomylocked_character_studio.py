@@ -4234,6 +4234,128 @@ section8_status = get_section8_finalization_status(section8_character_id)
 print("Section 8 status:")
 print(json.dumps(section8_status, indent=2))
 
+
+# SECTION 9 — Pose & Deformation Generation (Distinctive Anchor: S9_POSE_DEFORMATION_SCHEMA_V1)
+SECTION9_SCHEMA_VERSION = "section9.pose_deformation.v1"
+SECTION9_REQUIRED_STAGE = "section8"
+
+
+def _ensure_section9_pose_state(record: dict, character_id: str) -> dict:
+    section9_state = record.get("section9_pose_deformation")
+    if not isinstance(section9_state, dict):
+        section9_state = {}
+
+    section9_state.setdefault("schema_version", SECTION9_SCHEMA_VERSION)
+    section9_state.setdefault("character_id", character_id)
+    section9_state.setdefault("runs", [])
+    section9_state.setdefault("latest_run_id", None)
+    section9_state.setdefault("created_at", _utc_now_iso())
+    section9_state["updated_at"] = _utc_now_iso()
+    record["section9_pose_deformation"] = section9_state
+    return section9_state
+
+
+def _assert_section9_lifecycle_gate(record: dict) -> None:
+    section8_state = record.get("section8_canonical_finalization")
+    section8_anatomy_state = section8_state.get("anatomy_state") if isinstance(section8_state, dict) else None
+    lifecycle_state = (record.get("lifecycle") or {}).get("anatomy_state")
+    anatomy_state = section8_anatomy_state or lifecycle_state
+
+    if anatomy_state != "canonical_frozen":
+        raise RuntimeError(
+            "Section 9 requires Section 8 canonical freeze. "
+            "Run Section 8 finalization until anatomy_state == 'canonical_frozen'."
+        )
+
+
+def create_section9_pose_deformation_run(
+    character_id: str,
+    *,
+    pose_prompt: str,
+    source_operation_tag: str = "section9.pose_deformation",
+) -> dict:
+    if not isinstance(pose_prompt, str) or not pose_prompt.strip():
+        raise ValueError("pose_prompt must be a non-empty string.")
+
+    record = load_character_record(character_id)
+    _assert_section9_lifecycle_gate(record)
+    section9_state = _ensure_section9_pose_state(record, character_id)
+
+    run_id = f"s9_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+    run_entry = {
+        "run_id": run_id,
+        "timestamp": _utc_now_iso(),
+        "pose_prompt": pose_prompt.strip(),
+        "required_stage": SECTION9_REQUIRED_STAGE,
+        "source_operation_tag": source_operation_tag,
+    }
+
+    runs = section9_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    runs.append(run_entry)
+
+    section9_state["runs"] = runs
+    section9_state["latest_run_id"] = run_id
+    section9_state["updated_at"] = _utc_now_iso()
+    record["section9_pose_deformation"] = section9_state
+    save_character_record(character_id, record)
+    return run_entry
+
+
+def get_section9_pose_deformation_status(character_id: str) -> dict:
+    record = load_character_record(character_id)
+    section9_state = _ensure_section9_pose_state(record, character_id)
+
+    runs = section9_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+
+    anatomy_state = (
+        (record.get("section8_canonical_finalization") or {}).get("anatomy_state")
+        or (record.get("lifecycle") or {}).get("anatomy_state")
+        or "pre_finalization"
+    )
+
+    status = {
+        "character_id": character_id,
+        "schema_version": section9_state.get("schema_version"),
+        "required_stage": SECTION9_REQUIRED_STAGE,
+        "anatomy_state": anatomy_state,
+        "gate_pass": anatomy_state == "canonical_frozen",
+        "run_count": len(runs),
+        "latest_run_id": section9_state.get("latest_run_id"),
+    }
+    save_character_record(character_id, record)
+    return status
+
+
+# Section 9 workflow cell 1 — Input/config (minimal invocation example)
+section9_character_id = section8_character_id
+section9_pose_prompt = ""  # e.g., "standing contrapposto, left arm raised"
+
+print("Section 9 config:")
+print(json.dumps({
+    "character_id": section9_character_id,
+    "pose_prompt": section9_pose_prompt,
+}, indent=2))
+
+# Section 9 workflow cell 2 — Create pose deformation run (guarded invocation)
+if section9_pose_prompt:
+    section9_run_entry = create_section9_pose_deformation_run(
+        section9_character_id,
+        pose_prompt=section9_pose_prompt,
+    )
+    print("Section 9 run entry:")
+    print(json.dumps(section9_run_entry, indent=2))
+else:
+    print("Set section9_pose_prompt to create a Section 9 run.")
+
+# Section 9 workflow cell 3 — Status preview
+section9_status = get_section9_pose_deformation_status(section9_character_id)
+print("Section 9 status:")
+print(json.dumps(section9_status, indent=2))
+
 """
 ---
 

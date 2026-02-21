@@ -4320,6 +4320,51 @@ def _collect_section9_identity_artifact_issues(identity_lock: dict, character_di
     return issues
 
 
+def _resolve_section9_pose_assets(character_dir: Path, pose_spec: dict) -> list[dict]:
+    resolved_assets = []
+    for key, value in (pose_spec or {}).items():
+        if key in {"pose_id", "pose_label", "prompt", "negative_prompt", "seed"}:
+            continue
+
+        candidate_paths = []
+        if isinstance(value, str):
+            candidate_paths = [value]
+        elif isinstance(value, list):
+            candidate_paths = [item for item in value if isinstance(item, str)]
+        elif isinstance(value, dict):
+            candidate_paths = [item for item in value.values() if isinstance(item, str)]
+
+        for raw_path in candidate_paths:
+            source_path = Path(raw_path).expanduser()
+            if not source_path.is_absolute():
+                source_path = character_dir / source_path
+            resolved_assets.append({
+                "key": key,
+                "source": raw_path,
+                "resolved_path": str(source_path),
+                "exists": source_path.exists(),
+            })
+    return resolved_assets
+
+
+def _invoke_section9_generation_adapter(
+    character_id: str,
+    canonical_source_path: Path,
+    pose_spec: dict,
+    resolved_assets: list[dict],
+    output_path: Path,
+) -> dict:
+    del character_id, pose_spec, resolved_assets
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(canonical_source_path, output_path)
+    return {
+        "adapter": "placeholder",
+        "mode": "copy_canonical_source",
+        "output_path": str(output_path),
+        "note": "Replace with real generation adapter when Section 9 contracts are finalized.",
+    }
+
+
 def validate_section9_pose_request(
     character_id: str,
     *,
@@ -4470,6 +4515,104 @@ def create_section9_pose_deformation_run(
     section9_state["latest_run_id"] = run_id
     section9_state["updated_at"] = _utc_now_iso()
     record["section9_pose_deformation"] = section9_state
+    save_character_record(character_id, record)
+    return run_entry
+
+
+def run_pose_deformation_generation(
+    character_id: str,
+    canonical_image_path: str,
+    pose_spec: dict,
+    *,
+    notes: str | None = None,
+    source_operation_tag: str = "section9.pose_deformation",
+) -> dict:
+    if not isinstance(pose_spec, dict):
+        raise TypeError("pose_spec must be a dictionary")
+
+    record = load_character_record(character_id)
+    _assert_section9_lifecycle_gate(record)
+    section9_state = _ensure_section9_pose_state(record, character_id)
+
+    section8_state = record.get("section8_canonical_finalization")
+    finalizations = section8_state.get("finalizations") if isinstance(section8_state, dict) else None
+    if not isinstance(finalizations, list) or not finalizations:
+        raise RuntimeError("Section 8 finalization history is missing; cannot run Section 9 generation.")
+
+    character_dir = _character_dir(character_id)
+    canonical_source = Path(canonical_image_path).expanduser()
+    if not canonical_source.is_absolute():
+        canonical_source = character_dir / canonical_source
+    if not canonical_source.exists():
+        raise FileNotFoundError(f"Canonical image does not exist: {canonical_source}")
+
+    resolved_assets = _resolve_section9_pose_assets(character_dir, pose_spec)
+    missing_assets = [item for item in resolved_assets if not item.get("exists")]
+    if missing_assets:
+        missing_paths = [item["resolved_path"] for item in missing_assets]
+        raise FileNotFoundError(f"Section 9 pose assets not found: {missing_paths}")
+
+    pose_id = str(pose_spec.get("pose_id") or "pose-unspecified").strip() or "pose-unspecified"
+    pose_label = str(pose_spec.get("pose_label") or "custom").strip().lower() or "custom"
+    run_id = f"s9_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+
+    output_ext = canonical_source.suffix.lower() or ".png"
+    output_name = f"{run_id}_{pose_id.lower().replace(' ', '_')}{output_ext}"
+    output_rel = Path("canonical") / "pose_deformations" / output_name
+    output_abs = character_dir / output_rel
+
+    adapter_report = _invoke_section9_generation_adapter(
+        character_id,
+        canonical_source,
+        pose_spec,
+        resolved_assets,
+        output_abs,
+    )
+    output_sha = _sha256_file(output_abs)
+    identity_validation = validate_identity_lock(character_id, str(output_abs))
+
+    run_entry = {
+        "run_id": run_id,
+        "timestamp": _utc_now_iso(),
+        "pose_spec": dict(pose_spec),
+        "pose_id": pose_id,
+        "pose_label": pose_label,
+        "notes": notes,
+        "input": {
+            "canonical_image_path": str(canonical_source),
+            "canonical_image_sha256": _sha256_file(canonical_source),
+            "resolved_assets": resolved_assets,
+        },
+        "output": {
+            "image_path": str(output_rel),
+            "sha256": output_sha,
+        },
+        "validation": {
+            "identity_pass": bool(identity_validation.get("pass")),
+            "backend_used": identity_validation.get("backend_used"),
+            "summary": {
+                "reasons": list(identity_validation.get("reasons") or []),
+                "metrics": dict(identity_validation.get("metrics") or {}),
+            },
+            "report": identity_validation,
+        },
+        "provenance": {
+            "operation": "run_pose_deformation_generation",
+            "source_operation_tag": source_operation_tag,
+            "section_required_stage": SECTION9_REQUIRED_STAGE,
+            "adapter": adapter_report,
+        },
+    }
+
+    runs = section9_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    runs.append(run_entry)
+    section9_state["runs"] = runs
+    section9_state["latest_run_id"] = run_id
+    section9_state["updated_at"] = _utc_now_iso()
+    record["section9_pose_deformation"] = section9_state
+
     save_character_record(character_id, record)
     return run_entry
 

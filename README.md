@@ -114,7 +114,73 @@ This is not a random image generator. Once a character is finalized, identity mu
   - copies canonical image into `canonical/finalized/`
   - hard-freezes all Section 6 regions (`is_locked = True`, `is_frozen = True`)
   - stores append-only finalization history in `section8_canonical_finalization`
-  - updates lifecycle `anatomy_state` to `canonical_frozen`
+- updates lifecycle `anatomy_state` to `canonical_frozen`
+
+## Section 9 Acceptance Criteria (Pose/Deformation)
+
+Section 9 is considered accepted only when all checks below are satisfied:
+
+1. **Required pose-class coverage:** at least one successful run exists for every required pose class in `SECTION9_ALLOWED_POSE_LABELS`.
+2. **Per-run evidence completeness:** every run stores provenance, output hash, and a full validation report.
+3. **Drift-failure explainability:** identity drift failures are reproducible and include explicit failure reasons/metrics in persisted metadata.
+4. **Canonical freeze integrity:** Section 8 canonical state remains unchanged after any Section 9 run (`anatomy_state` remains `canonical_frozen`, no mutation of canonical freeze history).
+5. **Notebook/script API parity:** callable names and signatures for all Section 9 APIs match between `AnatomyLocked_Character_Studio.ipynb` and `anatomylocked_character_studio.py`.
+
+### Concrete verification checks
+
+- **Coverage check:** `get_section9_pose_status(character_id)` reports one or more `PASS` runs for each required pose label, with no missing class.
+- **Evidence check:** each stored run entry includes:
+  - `output.sha256`
+  - `validation.report`
+  - `provenance.operation`, `provenance.source_operation_tag`, and `provenance.adapter`
+- **Drift check:** for any failed identity validation, `validation.identity_pass` is `False` and details are present in `validation.summary.reasons`, `validation.summary.metrics`, and `validation.report`.
+- **Freeze integrity check:** `get_section9_pose_deformation_status(character_id)` continues to return `gate_pass=True` and `anatomy_state="canonical_frozen"` before and after Section 9 runs.
+- **API parity check:** Section 9 function definitions match in notebook/script for:
+  - `validate_section9_pose_request(...)`
+  - `create_section9_pose_deformation_run(...)`
+  - `run_pose_deformation_generation(...)`
+  - `get_section9_pose_deformation_status(...)`
+  - `get_section9_pose_status(...)`
+
+### Manual QA runbook (exact calls + expected statuses)
+
+1. **Preflight request validation**
+   - Call:
+     - `validate_section9_pose_request(character_id, pose_id="pose-standing-001", pose_label="standing", source_canonical_image=None)`
+   - Expect:
+     - `pass == True`
+     - `section8_finalized == True`
+     - `canonical_source_exists == True`
+
+2. **Run Section 9 generation**
+   - Call:
+     - `run_pose_deformation_generation(character_id, canonical_image_path, pose_spec={"pose_id": "pose-standing-001", "pose_label": "standing"}, notes="qa-standing")`
+   - Expect:
+     - `gate.status` is `PASS` or `PASS_WITH_WARNINGS`
+     - `output.sha256` is present
+     - `validation.report` is present
+
+3. **Check aggregate Section 9 status**
+   - Call:
+     - `get_section9_pose_status(character_id)`
+   - Expect:
+     - `total_runs` increases
+     - `latest_gate_status` reflects latest run gate (`PASS` / `PASS_WITH_WARNINGS` / `FAIL`)
+     - `latest_pose_label` equals submitted pose class
+
+4. **Check Section 8 freeze is still intact**
+   - Call:
+     - `get_section9_pose_deformation_status(character_id)`
+   - Expect:
+     - `gate_pass == True`
+     - `anatomy_state == "canonical_frozen"`
+
+5. **Drift failure reproducibility probe (intentional fail case)**
+   - Call with known bad output or incompatible identity artifact input:
+     - `create_section9_pose_deformation_run(character_id, pose_id="pose-bad-001", pose_label="standing", outputs=[{"image_path": "/tmp/nonexistent.png"}], source_operation_tag="qa.intentional_failure")`
+   - Expect:
+     - `gate.status == "FAIL"`
+     - persisted drift diagnostics in `validation.drift_reasons` and/or `validation.identity_checks[*].drift_reasons`
 
 ## Checklist
 

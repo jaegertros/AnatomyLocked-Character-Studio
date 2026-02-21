@@ -67,6 +67,40 @@ This is not a random image generator. Once a character is finalized, identity mu
   - `fail_on_missing_mask = True`
 - Comfy translation for this lock schema is intentionally deferred until notebook Sections 5-8 are stable.
 
+## Section 7 Plan (Regional Refinement Mode)
+
+### Goal
+- Build a repeatable regional refinement workflow that improves local fidelity (face/hair/torso) without violating Section 5 identity lock invariants and while respecting Section 6 canonical region masks.
+
+### Core functions to implement (notebook first, then script mirror)
+- `load_region_map(character_id)`
+- `validate_region_map(region_map, masks_dir)`
+- `run_regional_refinement(character_id, input_image_path, config=None)`
+- `validate_regional_refinement(character_id, refined_image_path, strict=True)`
+- `promote_refined_candidate(character_id, refined_image_path, report)`
+
+### Gate policy
+- Gate A (hard fail): identity lock pass required.
+- Gate B (hard fail): all required regions processed.
+- Gate C (configurable hard/soft fail): regional quality checks.
+- Gate D (hard fail): provenance completeness for reproducibility.
+- Summary status: `PASS`, `PASS_WITH_WARNINGS`, `FAIL`.
+
+### Initial region scope
+- `face_primary` (strictest identity constraints)
+- `hair_silhouette`
+- `upper_torso`
+
+### Execution sequence
+1. Finalize Section 6 schema + validators.
+2. Add `regional_refinement` append-only block in `character.json`.
+3. Implement load/validate helpers for region map + masks.
+4. Implement deterministic per-region refinement/compositing.
+5. Run identity validation with backend fallback (`insightface -> clip -> phash/dhash`).
+6. Emit/persist validation report and promotion metadata.
+7. Mirror notebook logic into `anatomylocked_character_studio.py`.
+8. Run dry QA on 3-5 characters with varied pose/lighting.
+
 ## Checklist
 
 See Character_Set_Validation_Checklist.md for a validation template.

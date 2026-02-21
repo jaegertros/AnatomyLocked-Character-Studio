@@ -4252,6 +4252,36 @@ SECTION9_GATE_PASS = "PASS"
 SECTION9_GATE_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
 SECTION9_GATE_FAIL = "FAIL"
 
+SECTION10_ALLOWED_VIEWS = {"front", "back", "left", "right", "3q"}
+SECTION10_ALLOWED_FRAMING = {"full_body", "three_quarter", "waist_up", "close_up"}
+SECTION10_GATE_PASS = "PASS"
+SECTION10_GATE_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
+SECTION10_GATE_FAIL = "FAIL"
+
+
+SECTION10_SCHEMA_VERSION = "section10.lighting_camera_reference.v1"
+SECTION10_REQUIRED_STAGE = "section8"
+SECTION10_ALLOWED_LIGHTING_PRESETS = {
+    "neutral_studio",
+    "soft_key",
+    "rim_light",
+    "dramatic_split",
+    "outdoor_overcast",
+}
+SECTION10_ALLOWED_VIEW_LABELS = {
+    "front",
+    "three_quarter_left",
+    "three_quarter_right",
+    "profile_left",
+    "profile_right",
+}
+SECTION10_ALLOWED_CAMERA_PROFILE_TYPES = {
+    "portrait_85mm",
+    "standard_50mm",
+    "wide_35mm",
+    "orthographic",
+}
+
 
 def _ensure_section9_pose_state(record: dict, character_id: str) -> dict:
     section9_state = record.get("section9_pose_deformation")
@@ -4294,6 +4324,119 @@ def _resolve_section9_canonical_source(record: dict, character_dir: Path, source
         if isinstance(latest_rel, str) and latest_rel.strip():
             return latest_rel, (character_dir / latest_rel)
     return None, None
+
+
+def _resolve_section10_canonical_source(record: dict, character_dir: Path, source_canonical_image: str | None = None) -> tuple[str | None, Path | None]:
+    return _resolve_section9_canonical_source(record, character_dir, source_canonical_image)
+
+
+def validate_section10_reference_request(
+    character_id: str,
+    *,
+    view_spec: dict,
+    lighting_spec: dict,
+    camera_spec: dict,
+    source_canonical_image: str | None = None,
+) -> dict:
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+
+    missing_asset_reasons = []
+    policy_violation_reasons = []
+    warnings = []
+
+    canonical_rel, canonical_path = _resolve_section10_canonical_source(record, character_dir, source_canonical_image)
+    canonical_exists = bool(canonical_path and canonical_path.exists())
+    if not canonical_exists:
+        missing_asset_reasons.append("Canonical source image is required and must exist.")
+
+    normalized_view = str((view_spec or {}).get("view") or "").strip().lower()
+    if normalized_view not in SECTION10_ALLOWED_VIEWS:
+        policy_violation_reasons.append(
+            f"view_spec.view must be one of {sorted(SECTION10_ALLOWED_VIEWS)}."
+        )
+
+    pose_reference = (view_spec or {}).get("pose_reference")
+    normalized_pose_reference = None
+    pose_reference_exists = None
+    if isinstance(pose_reference, str) and pose_reference.strip():
+        normalized_pose_reference = pose_reference.strip()
+        pose_reference_path = Path(normalized_pose_reference).expanduser()
+        if not pose_reference_path.is_absolute():
+            pose_reference_path = character_dir / pose_reference_path
+        pose_reference_exists = pose_reference_path.exists()
+        if not pose_reference_exists:
+            missing_asset_reasons.append(f"Optional pose reference does not exist: {normalized_pose_reference}")
+            warnings.append("Proceeding without pose_reference may reduce pose fidelity.")
+
+    normalized_lighting_mode = str((lighting_spec or {}).get("mode") or "").strip().lower()
+    if normalized_lighting_mode != "neutral_studio":
+        policy_violation_reasons.append("lighting_spec.mode must be 'neutral_studio' for Section 10 baselines.")
+
+    dramatic_variants = (lighting_spec or {}).get("dramatic_variants")
+    normalized_dramatic_variants = []
+    if isinstance(dramatic_variants, list):
+        normalized_dramatic_variants = sorted(
+            str(item).strip().lower() for item in dramatic_variants if str(item).strip()
+        )
+        if normalized_dramatic_variants:
+            warnings.append("dramatic_variants are optional and should only be used after neutral studio outputs.")
+
+    focal_length_value = (camera_spec or {}).get("focal_length_mm")
+    normalized_focal_length = None
+    if isinstance(focal_length_value, (int, float)):
+        normalized_focal_length = float(focal_length_value)
+    else:
+        try:
+            normalized_focal_length = float(str(focal_length_value).strip())
+        except (TypeError, ValueError):
+            normalized_focal_length = None
+
+    if normalized_focal_length is None or normalized_focal_length <= 0:
+        policy_violation_reasons.append("camera_spec.focal_length_mm must be a positive number.")
+
+    orthographic_like = bool((camera_spec or {}).get("orthographic_like"))
+    framing = str((camera_spec or {}).get("framing") or "").strip().lower()
+    if framing not in SECTION10_ALLOWED_FRAMING:
+        policy_violation_reasons.append(
+            f"camera_spec.framing must be one of {sorted(SECTION10_ALLOWED_FRAMING)}."
+        )
+
+    if normalized_focal_length and normalized_focal_length < 35 and not orthographic_like:
+        warnings.append("focal_length_mm < 35 can introduce perspective distortion; consider orthographic_like=True.")
+
+    if missing_asset_reasons or policy_violation_reasons:
+        gate_result = SECTION10_GATE_FAIL
+    elif warnings:
+        gate_result = SECTION10_GATE_PASS_WITH_WARNINGS
+    else:
+        gate_result = SECTION10_GATE_PASS
+
+    return {
+        "character_id": character_id,
+        "gate_result": gate_result,
+        "normalized_specs": {
+            "source_canonical_image": canonical_rel,
+            "view_spec": {
+                "view": normalized_view,
+                "pose_reference": normalized_pose_reference,
+                "pose_reference_exists": pose_reference_exists,
+            },
+            "lighting_spec": {
+                "mode": normalized_lighting_mode,
+                "dramatic_variants": normalized_dramatic_variants,
+            },
+            "camera_spec": {
+                "focal_length_mm": normalized_focal_length,
+                "orthographic_like": orthographic_like,
+                "framing": framing,
+            },
+        },
+        "missing_asset_reasons": missing_asset_reasons,
+        "policy_violation_reasons": policy_violation_reasons,
+        "warnings": warnings,
+        "pass": gate_result != SECTION10_GATE_FAIL,
+    }
 
 
 def _collect_section9_identity_artifact_issues(identity_lock: dict, character_dir: Path) -> list[str]:
@@ -4765,6 +4908,155 @@ def get_section9_pose_status(character_id: str) -> dict:
     return status
 
 
+def _ensure_section10_reference_state(record: dict, character_id: str) -> dict:
+    section10_state = record.get("section10_lighting_camera_reference")
+    if not isinstance(section10_state, dict):
+        section10_state = {}
+
+    section10_state.setdefault("schema_version", SECTION10_SCHEMA_VERSION)
+    section10_state.setdefault("character_id", character_id)
+    section10_state.setdefault("runs", [])
+    section10_state.setdefault("latest_run_id", None)
+    section10_state.setdefault("created_at", _utc_now_iso())
+    section10_state["updated_at"] = _utc_now_iso()
+    record["section10_lighting_camera_reference"] = section10_state
+    return section10_state
+
+
+def _assert_section10_lifecycle_gate(record: dict) -> None:
+    section8_state = record.get("section8_canonical_finalization")
+    section8_anatomy_state = section8_state.get("anatomy_state") if isinstance(section8_state, dict) else None
+    lifecycle_state = (record.get("lifecycle") or {}).get("anatomy_state")
+    anatomy_state = section8_anatomy_state or lifecycle_state
+
+    if anatomy_state != "canonical_frozen":
+        raise RuntimeError(
+            "Section 10 requires Section 8 canonical freeze. "
+            "Run Section 8 finalization until anatomy_state == 'canonical_frozen'."
+        )
+
+
+def create_section10_lighting_camera_reference_run(
+    character_id: str,
+    source_image_path: str,
+    *,
+    lighting_preset: str,
+    view_label: str,
+    camera_profile_type: str,
+    notes: str | None = None,
+    source_operation_tag: str = "section10.lighting_camera_reference",
+) -> dict:
+    record = load_character_record(character_id)
+    _assert_section10_lifecycle_gate(record)
+    section10_state = _ensure_section10_reference_state(record, character_id)
+
+    normalized_lighting = str(lighting_preset or "").strip().lower()
+    normalized_view = str(view_label or "").strip().lower()
+    normalized_camera = str(camera_profile_type or "").strip().lower()
+
+    if normalized_lighting not in SECTION10_ALLOWED_LIGHTING_PRESETS:
+        raise ValueError(
+            f"lighting_preset '{lighting_preset}' is not supported. "
+            f"Allowed presets: {sorted(SECTION10_ALLOWED_LIGHTING_PRESETS)}"
+        )
+    if normalized_view not in SECTION10_ALLOWED_VIEW_LABELS:
+        raise ValueError(
+            f"view_label '{view_label}' is not supported. "
+            f"Allowed views: {sorted(SECTION10_ALLOWED_VIEW_LABELS)}"
+        )
+    if normalized_camera not in SECTION10_ALLOWED_CAMERA_PROFILE_TYPES:
+        raise ValueError(
+            f"camera_profile_type '{camera_profile_type}' is not supported. "
+            f"Allowed profiles: {sorted(SECTION10_ALLOWED_CAMERA_PROFILE_TYPES)}"
+        )
+
+    if SECTION10_REQUIRED_STAGE == "section9":
+        section9_runs = ((record.get("section9_pose_deformation") or {}).get("runs") or [])
+        if not isinstance(section9_runs, list) or not section9_runs:
+            raise RuntimeError("Section 10 requires at least one Section 9 run when SECTION10_REQUIRED_STAGE='section9'.")
+
+    character_dir = _character_dir(character_id)
+    source_path = Path(source_image_path).expanduser()
+    if not source_path.is_absolute():
+        source_path = character_dir / source_path
+    if not source_path.exists():
+        raise FileNotFoundError(f"Section 10 source image does not exist: {source_path}")
+
+    run_id = f"s10_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+    output_name = f"{run_id}_{normalized_view}_{normalized_lighting}{source_path.suffix.lower() or '.png'}"
+    output_rel, output_sha = _copy_to_character_subdir(
+        character_dir,
+        source_path,
+        "canonical/lighting_camera_reference",
+        output_name,
+    )
+
+    run_entry = {
+        "run_id": run_id,
+        "timestamp": _utc_now_iso(),
+        "lighting_preset": normalized_lighting,
+        "view_label": normalized_view,
+        "camera_profile_type": normalized_camera,
+        "required_stage": SECTION10_REQUIRED_STAGE,
+        "source_image": {
+            "path": str(source_path),
+            "sha256": _sha256_file(source_path),
+        },
+        "output": {
+            "image_path": output_rel,
+            "sha256": output_sha,
+        },
+        "notes": (notes or "").strip() or None,
+        "provenance": {
+            "operation": "create_section10_lighting_camera_reference_run",
+            "source_operation_tag": source_operation_tag,
+        },
+    }
+
+    runs = section10_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    runs.append(run_entry)
+    section10_state["runs"] = runs
+    section10_state["latest_run_id"] = run_id
+    section10_state["updated_at"] = _utc_now_iso()
+    record["section10_lighting_camera_reference"] = section10_state
+
+    save_character_record(character_id, record)
+    return run_entry
+
+
+def get_section10_lighting_camera_reference_status(character_id: str) -> dict:
+    record = load_character_record(character_id)
+    section10_state = _ensure_section10_reference_state(record, character_id)
+
+    runs = section10_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+
+    anatomy_state = (
+        (record.get("section8_canonical_finalization") or {}).get("anatomy_state")
+        or (record.get("lifecycle") or {}).get("anatomy_state")
+        or "pre_finalization"
+    )
+
+    latest_run = runs[-1] if runs and isinstance(runs[-1], dict) else {}
+    status = {
+        "character_id": character_id,
+        "schema_version": section10_state.get("schema_version"),
+        "required_stage": SECTION10_REQUIRED_STAGE,
+        "anatomy_state": anatomy_state,
+        "gate_pass": anatomy_state == "canonical_frozen",
+        "run_count": len(runs),
+        "latest_run_id": section10_state.get("latest_run_id"),
+        "latest_lighting_preset": latest_run.get("lighting_preset"),
+        "latest_view_label": latest_run.get("view_label"),
+        "latest_camera_profile_type": latest_run.get("camera_profile_type"),
+    }
+    save_character_record(character_id, record)
+    return status
+
+
 # Section 9 workflow cell 1 — Input/config (minimal invocation example)
 section9_character_id = section8_character_id
 section9_canonical_image_path = ""  # required path to canonical frozen image
@@ -4799,6 +5091,282 @@ else:
 section9_status = get_section9_pose_status(section9_character_id)
 print("Section 9 status:")
 print(json.dumps(section9_status, indent=2))
+
+
+# SECTION 10 — Lighting, Camera & Reference Views (Distinctive Anchor: S10_LIGHTING_CAMERA_REFERENCE_SCHEMA_V1)
+SECTION10_SCHEMA_VERSION = "section10.lighting_camera_reference.v1"
+SECTION10_REQUIRED_STAGE = "section8"
+SECTION10_GATE_PASS = "PASS"
+SECTION10_GATE_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
+SECTION10_GATE_FAIL = "FAIL"
+
+
+def _ensure_section10_reference_state(record: dict, character_id: str) -> dict:
+    section10_state = record.get("section10_lighting_camera_reference")
+    if not isinstance(section10_state, dict):
+        section10_state = {}
+
+    section10_state.setdefault("schema_version", SECTION10_SCHEMA_VERSION)
+    section10_state.setdefault("character_id", character_id)
+    section10_state.setdefault("runs", [])
+    section10_state.setdefault("latest_run_id", None)
+    section10_state.setdefault("created_at", _utc_now_iso())
+    section10_state["updated_at"] = _utc_now_iso()
+    record["section10_lighting_camera_reference"] = section10_state
+    return section10_state
+
+
+def _section10_slug(value: str, fallback: str) -> str:
+    raw = str(value or "").strip().lower()
+    filtered = "".join(ch if ch.isalnum() else "_" for ch in raw)
+    slug = "_".join(part for part in filtered.split("_") if part)
+    return slug or fallback
+
+
+def _section10_run_id(run_id: str | None = None) -> str:
+    if run_id and str(run_id).strip():
+        return _section10_slug(str(run_id), "s10")
+    return f"s10-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+
+
+def _section10_resolve_variants(request_spec: dict | None) -> list[dict]:
+    if not isinstance(request_spec, dict):
+        request_spec = {}
+
+    variants = request_spec.get("variants")
+    if isinstance(variants, list) and variants:
+        resolved = []
+        for index, variant in enumerate(variants, start=1):
+            if not isinstance(variant, dict):
+                continue
+            resolved.append({
+                "variant_id": str(variant.get("variant_id") or f"v{index:02d}"),
+                "view": str(variant.get("view") or "front"),
+                "lighting": str(variant.get("lighting") or "neutral_studio"),
+                "camera_tag": str(variant.get("camera_tag") or "eye_level"),
+                "notes": str(variant.get("notes") or ""),
+            })
+        if resolved:
+            return resolved
+
+    return [{
+        "variant_id": "v01",
+        "view": str(request_spec.get("view") or "front"),
+        "lighting": str(request_spec.get("lighting") or "neutral_studio"),
+        "camera_tag": str(request_spec.get("camera_tag") or "eye_level"),
+        "notes": str(request_spec.get("notes") or ""),
+    }]
+
+
+def _evaluate_section10_variant_qc(validation_report: dict) -> dict:
+    pass_flag = bool(validation_report.get("pass"))
+    warnings = list(validation_report.get("warnings") or [])
+    reasons = list(validation_report.get("reasons") or [])
+    drift_warnings = []
+
+    if not pass_flag:
+        drift_warnings.append("Identity lock validation failed.")
+    if reasons:
+        drift_warnings.extend([f"reason: {reason}" for reason in reasons])
+    if warnings:
+        drift_warnings.extend([f"warning: {warning}" for warning in warnings])
+
+    status = SECTION10_GATE_PASS
+    if not pass_flag:
+        status = SECTION10_GATE_FAIL
+    elif drift_warnings:
+        status = SECTION10_GATE_PASS_WITH_WARNINGS
+
+    return {
+        "status": status,
+        "identity_pass": pass_flag,
+        "drift_warnings": drift_warnings,
+        "reason_count": len(reasons),
+        "warning_count": len(warnings),
+    }
+
+
+def run_lighting_camera_reference_generation(
+    character_id: str,
+    canonical_image_path: str,
+    request_spec: dict,
+    run_id: str | None = None,
+    notes: str | None = None,
+    source_operation_tag: str = "section10.lighting_camera_reference",
+) -> dict:
+    canonical_source = Path(canonical_image_path).expanduser()
+    if not canonical_source.exists():
+        raise FileNotFoundError(f"canonical_image_path does not exist: {canonical_source}")
+
+    normalized_run_id = _section10_run_id(run_id)
+    record = load_character_record(character_id)
+    _ensure_section10_reference_state(record, character_id)
+
+    character_dir = _character_dir(character_id)
+    output_dir = character_dir / "canonical" / "reference_views"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved_variants = _section10_resolve_variants(request_spec)
+    output_entries = []
+    qc_statuses = []
+
+    for variant in resolved_variants:
+        view_slug = _section10_slug(variant.get("view"), "front")
+        lighting_slug = _section10_slug(variant.get("lighting"), "neutral")
+        camera_slug = _section10_slug(variant.get("camera_tag"), "eye_level")
+        variant_slug = _section10_slug(variant.get("variant_id"), "v01")
+        output_name = (
+            f"{normalized_run_id}__{variant_slug}"
+            f"__view-{view_slug}__light-{lighting_slug}__cam-{camera_slug}"
+            f"{canonical_source.suffix.lower() or '.png'}"
+        )
+
+        output_abs = output_dir / output_name
+        shutil.copy2(canonical_source, output_abs)
+        output_rel = output_abs.relative_to(character_dir).as_posix()
+        output_sha = _sha256_file(output_abs)
+
+        validation_report = validate_identity_lock(character_id, str(output_abs))
+        variant_qc = _evaluate_section10_variant_qc(validation_report)
+        qc_statuses.append(variant_qc.get("status"))
+
+        output_entries.append({
+            "variant": variant,
+            "file": output_rel,
+            "sha256": output_sha,
+            "identity_validation": {
+                "pass": bool(validation_report.get("pass")),
+                "backend_used": validation_report.get("backend_used"),
+                "metrics": dict(validation_report.get("metrics") or {}),
+                "reasons": list(validation_report.get("reasons") or []),
+                "warnings": list(validation_report.get("warnings") or []),
+                "drift_warnings": list(variant_qc.get("drift_warnings") or []),
+                "qc_status": variant_qc.get("status"),
+            },
+            "created_at": _utc_now_iso(),
+        })
+
+    qc_summary = {
+        "pass_count": sum(1 for status in qc_statuses if status == SECTION10_GATE_PASS),
+        "warn_count": sum(1 for status in qc_statuses if status == SECTION10_GATE_PASS_WITH_WARNINGS),
+        "fail_count": sum(1 for status in qc_statuses if status == SECTION10_GATE_FAIL),
+    }
+    if qc_summary["fail_count"] > 0:
+        qc_summary["overall_status"] = SECTION10_GATE_FAIL
+    elif qc_summary["warn_count"] > 0:
+        qc_summary["overall_status"] = SECTION10_GATE_PASS_WITH_WARNINGS
+    else:
+        qc_summary["overall_status"] = SECTION10_GATE_PASS
+
+    run_entry = {
+        "run_id": normalized_run_id,
+        "timestamp": _utc_now_iso(),
+        "inputs": {
+            "canonical_image_path": str(canonical_source),
+            "canonical_image_sha256": _sha256_file(canonical_source),
+            "request_spec": dict(request_spec or {}),
+            "resolved_variants": resolved_variants,
+            "notes": notes,
+        },
+        "outputs": output_entries,
+        "qc_summary": qc_summary,
+        "provenance": {
+            "operation": "run_lighting_camera_reference_generation",
+            "source_operation_tag": source_operation_tag,
+            "section_required_stage": SECTION10_REQUIRED_STAGE,
+            "adapter": "placeholder_copy_canonical_source",
+        },
+    }
+
+    record = load_character_record(character_id)
+    section10_state = _ensure_section10_reference_state(record, character_id)
+    runs = section10_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    runs.append(run_entry)
+    section10_state["runs"] = runs
+    section10_state["latest_run_id"] = normalized_run_id
+    section10_state["updated_at"] = _utc_now_iso()
+    record["section10_lighting_camera_reference"] = section10_state
+    save_character_record(character_id, record)
+    return run_entry
+
+
+def get_section10_reference_status(character_id: str) -> dict:
+    record = load_character_record(character_id)
+    section10_state = _ensure_section10_reference_state(record, character_id)
+    runs = section10_state.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+
+    overall_counts = {"PASS": 0, "PASS_WITH_WARNINGS": 0, "FAIL": 0}
+    total_outputs = 0
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        qc_summary = run.get("qc_summary") if isinstance(run.get("qc_summary"), dict) else {}
+        status = str(qc_summary.get("overall_status") or "")
+        if status in overall_counts:
+            overall_counts[status] += 1
+        outputs = run.get("outputs")
+        if isinstance(outputs, list):
+            total_outputs += len(outputs)
+
+    status_report = {
+        "character_id": character_id,
+        "schema_version": section10_state.get("schema_version"),
+        "required_stage": SECTION10_REQUIRED_STAGE,
+        "run_count": len(runs),
+        "output_count": total_outputs,
+        "latest_run_id": section10_state.get("latest_run_id"),
+        "pass_count": overall_counts["PASS"],
+        "warn_count": overall_counts["PASS_WITH_WARNINGS"],
+        "fail_count": overall_counts["FAIL"],
+    }
+    save_character_record(character_id, record)
+    return status_report
+
+
+# Section 10 workflow cell 1 — Input/config (user editable)
+section10_character_id = section9_character_id
+section10_canonical_image_path = ""  # e.g., "/content/canonical_v1.png"
+section10_request_spec = {
+    "variants": [
+        {"variant_id": "front_neutral", "view": "front", "lighting": "neutral_studio", "camera_tag": "eye_level"},
+        {"variant_id": "profile_left_soft", "view": "profile_left", "lighting": "soft_fill", "camera_tag": "35mm"},
+    ]
+}
+section10_notes = ""
+
+print("Section 10 config:")
+print(json.dumps({
+    "character_id": section10_character_id,
+    "source_image_path": section10_source_image_path,
+    "lighting_preset": section10_lighting_preset,
+    "view_label": section10_view_label,
+    "camera_profile_type": section10_camera_profile_type,
+    "notes": section10_notes,
+}, indent=2))
+
+# Section 10 workflow cell 2 — Register lighting/camera reference (guarded invocation)
+if section10_source_image_path:
+    section10_run_result = create_section10_lighting_camera_reference_run(
+        section10_character_id,
+        section10_source_image_path,
+        lighting_preset=section10_lighting_preset,
+        view_label=section10_view_label,
+        camera_profile_type=section10_camera_profile_type,
+        notes=section10_notes or None,
+    )
+    print("Section 10 run result:")
+    print(json.dumps(section10_run_result, indent=2))
+else:
+    print("Set section10_source_image_path to run Section 10.")
+
+# Section 10 workflow cell 3 — Status preview
+section10_status = get_section10_lighting_camera_reference_status(section10_character_id)
+print("Section 10 status:")
+print(json.dumps(section10_status, indent=2))
 
 """
 ---

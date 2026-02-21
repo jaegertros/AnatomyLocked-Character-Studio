@@ -4248,6 +4248,10 @@ SECTION9_ALLOWED_POSE_LABELS = {
     "flexing",
 }
 
+SECTION9_GATE_PASS = "PASS"
+SECTION9_GATE_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
+SECTION9_GATE_FAIL = "FAIL"
+
 
 def _ensure_section9_pose_state(record: dict, character_id: str) -> dict:
     section9_state = record.get("section9_pose_deformation")
@@ -4362,6 +4366,87 @@ def _invoke_section9_generation_adapter(
         "mode": "copy_canonical_source",
         "output_path": str(output_path),
         "note": "Replace with real generation adapter when Section 9 contracts are finalized.",
+    }
+
+
+def evaluate_section9_run(report: dict) -> dict:
+    if not isinstance(report, dict):
+        raise TypeError("report must be a dictionary")
+
+    failures = []
+    warnings = []
+
+    validation = report.get("validation") if isinstance(report.get("validation"), dict) else {}
+    identity_pass = validation.get("identity_pass")
+    if identity_pass is None and isinstance(validation.get("report"), dict):
+        identity_pass = validation["report"].get("pass")
+    if identity_pass is False:
+        failures.append("Identity lock validation failed.")
+
+    provenance = report.get("provenance") if isinstance(report.get("provenance"), dict) else {}
+    source_tag = provenance.get("source_operation_tag") or report.get("source_operation_tag")
+
+    input_payload = report.get("input") if isinstance(report.get("input"), dict) else {}
+    output_payload = report.get("output") if isinstance(report.get("output"), dict) else {}
+    source_info = input_payload.get("canonical_image_path") or report.get("source_canonical_image")
+    input_hash = input_payload.get("canonical_image_sha256")
+
+    output_hash_present = isinstance(output_payload.get("sha256"), str) and bool(output_payload.get("sha256"))
+    outputs = report.get("outputs") if isinstance(report.get("outputs"), list) else []
+    outputs_have_hashes = bool(outputs) and all(
+        isinstance(item, dict) and isinstance(item.get("hash"), str) and bool(item.get("hash"))
+        for item in outputs
+    )
+
+    missing_provenance_fields = []
+    if not isinstance(source_tag, str) or not source_tag.strip():
+        missing_provenance_fields.append("source_operation_tag")
+    if not isinstance(source_info, str) or not source_info.strip():
+        missing_provenance_fields.append("input/source")
+    if not isinstance(input_hash, str) or not input_hash.strip():
+        missing_provenance_fields.append("input/hash")
+    if not output_hash_present and not outputs_have_hashes:
+        missing_provenance_fields.append("output/hash")
+
+    if missing_provenance_fields:
+        failures.append(f"Missing provenance fields: {missing_provenance_fields}")
+
+    unresolved_required_artifacts = []
+    resolved_assets = input_payload.get("resolved_assets") if isinstance(input_payload.get("resolved_assets"), list) else []
+    unresolved_required_artifacts.extend(
+        item.get("resolved_path")
+        for item in resolved_assets
+        if isinstance(item, dict) and item.get("exists") is False
+    )
+
+    request_validation = validation.get("request") if isinstance(validation.get("request"), dict) else {}
+    request_failures = request_validation.get("failures") if isinstance(request_validation.get("failures"), list) else []
+    unresolved_required_artifacts.extend(
+        failure for failure in request_failures if isinstance(failure, str) and "artifact" in failure.lower()
+    )
+
+    if unresolved_required_artifacts:
+        failures.append(f"Unresolved required artifacts: {unresolved_required_artifacts}")
+
+    anatomy_heuristics = report.get("anatomy_heuristics")
+    if anatomy_heuristics is None:
+        anatomy_heuristics = validation.get("anatomy_heuristics")
+    if isinstance(anatomy_heuristics, dict):
+        heuristics_failed = anatomy_heuristics.get("pass") is False
+        heuristics_failures = anatomy_heuristics.get("failures") if isinstance(anatomy_heuristics.get("failures"), list) else []
+        if heuristics_failed or heuristics_failures:
+            warnings.append(
+                f"Optional anatomy heuristics reported issues: {heuristics_failures or ['anatomy_heuristics.pass == False']}"
+            )
+
+    gate_status = SECTION9_GATE_FAIL if failures else (
+        SECTION9_GATE_PASS_WITH_WARNINGS if warnings else SECTION9_GATE_PASS
+    )
+    return {
+        "gate_status": gate_status,
+        "gate_failures": failures,
+        "gate_warnings": warnings,
+        "decision_timestamp": _utc_now_iso(),
     }
 
 
@@ -4505,6 +4590,7 @@ def create_section9_pose_deformation_run(
         "required_stage": SECTION9_REQUIRED_STAGE,
         "source_operation_tag": source_operation_tag,
     }
+    run_entry.update(evaluate_section9_run(run_entry))
 
     runs = section9_state.get("runs")
     if not isinstance(runs, list):
@@ -4603,6 +4689,7 @@ def run_pose_deformation_generation(
             "adapter": adapter_report,
         },
     }
+    run_entry.update(evaluate_section9_run(run_entry))
 
     runs = section9_state.get("runs")
     if not isinstance(runs, list):

@@ -2971,6 +2971,7 @@ else:
 
 # SECTION 6 — Body Region Map Creation (Distinctive Anchor: S6_BODY_REGION_MAP_SCHEMA_V1)
 SECTION6_BODY_REGION_SCHEMA_VERSION = "section6.body_region_map.v1"
+SECTION6_READY_MESSAGE = "Section 6 complete; safe to begin Section 7."
 SECTION6_REGION_DEFAULTS = [
     ("head", "Head", "none", "core"),
     ("neck", "Neck", "none", "core"),
@@ -2987,8 +2988,6 @@ SECTION6_REGION_DEFAULTS = [
 ]
 SECTION6_REQUIRED_REGION_KEYS = [region_id for region_id, _, _, _ in SECTION6_REGION_DEFAULTS]
 SECTION6_REQUIRED_MASK_REGIONS = list(SECTION6_REQUIRED_REGION_KEYS)
-
-
 SECTION6_REGION_MASK_SUBDIR = "identity/masks/regions"
 
 
@@ -3036,30 +3035,61 @@ def _default_body_region_entry(
     label: str,
     side: str,
     parent_group: str,
+    *,
+    operation_tag: str,
 ) -> dict:
     return {
+        "region_id": region_id,
         "label": label,
         "side": side,
         "parent_group": parent_group,
         "mask_path": _section6_region_mask_relpath(region_id),
         "mask_metadata": None,
         "is_locked": False,
+        "is_frozen": False,
+        "last_edited_at": _utc_now_iso(),
+        "source_operation_tag": operation_tag,
         "notes": None,
     }
 
 
+def _normalize_body_region_entry(region_id: str, region_payload: dict, fallback_defaults: tuple[str, str, str], *, operation_tag: str) -> dict:
+    label, side, parent_group = fallback_defaults
+    payload = dict(region_payload) if isinstance(region_payload, dict) else {}
+
+    payload.setdefault("region_id", region_id)
+    payload.setdefault("label", label)
+    payload.setdefault("side", side)
+    payload.setdefault("parent_group", parent_group)
+    payload.setdefault("mask_path", _section6_region_mask_relpath(region_id))
+    payload.setdefault("mask_metadata", None)
+    payload["is_locked"] = bool(payload.get("is_locked", False))
+    payload["is_frozen"] = bool(payload.get("is_frozen", False))
+    payload.setdefault("last_edited_at", _utc_now_iso())
+    payload.setdefault("source_operation_tag", operation_tag)
+    payload.setdefault("notes", None)
+    return payload
+
+
 def build_default_body_region_map(*, source: str = "section6_initializer", pose_reference: str | None = None, image_reference: str | None = None) -> dict:
     regions = {
-        region_id: _default_body_region_entry(region_id, label, side, parent_group)
+        region_id: _default_body_region_entry(region_id, label, side, parent_group, operation_tag=source)
         for region_id, label, side, parent_group in SECTION6_REGION_DEFAULTS
     }
     return {
         "schema_version": SECTION6_BODY_REGION_SCHEMA_VERSION,
         "created_at": _utc_now_iso(),
+        "updated_at": _utc_now_iso(),
         "source": source,
         "pose_reference": pose_reference,
         "image_reference": image_reference,
         "mask_root": SECTION6_REGION_MASK_SUBDIR,
+        "section7_handoff": {
+            "ready": False,
+            "message": None,
+            "finalized_at": None,
+            "required_region_set": list(SECTION6_REQUIRED_REGION_KEYS),
+        },
         "regions": regions,
     }
 
@@ -3068,26 +3098,46 @@ def ensure_body_region_map(character_id: str, *, source: str = "section6_initial
     """Backward-safe initializer for Section 6 payload under character.json."""
     record = load_character_record(character_id)
     existing_map = record.get("body_region_map")
-    if isinstance(existing_map, dict) and isinstance(existing_map.get("regions"), dict):
-        if "mask_root" not in existing_map:
-            existing_map["mask_root"] = SECTION6_REGION_MASK_SUBDIR
-        for region_id, region_data in existing_map.get("regions", {}).items():
-            if not isinstance(region_data, dict):
-                continue
-            if not region_data.get("mask_path"):
-                region_data["mask_path"] = _section6_region_mask_relpath(region_id)
-        record["body_region_map"] = existing_map
-        save_character_record(character_id, record)
-        return existing_map
 
-    body_region_map = build_default_body_region_map(
-        source=source,
-        pose_reference=pose_reference,
-        image_reference=image_reference,
-    )
-    record["body_region_map"] = body_region_map
+    if not isinstance(existing_map, dict) or not isinstance(existing_map.get("regions"), dict):
+        body_region_map = build_default_body_region_map(
+            source=source,
+            pose_reference=pose_reference,
+            image_reference=image_reference,
+        )
+        record["body_region_map"] = body_region_map
+        save_character_record(character_id, record)
+        return body_region_map
+
+    existing_map.setdefault("mask_root", SECTION6_REGION_MASK_SUBDIR)
+    existing_map.setdefault("source", source)
+    existing_map.setdefault("pose_reference", pose_reference)
+    existing_map.setdefault("image_reference", image_reference)
+    existing_map.setdefault("created_at", _utc_now_iso())
+    existing_map["updated_at"] = _utc_now_iso()
+
+    handoff = existing_map.get("section7_handoff") if isinstance(existing_map.get("section7_handoff"), dict) else {}
+    handoff.setdefault("ready", False)
+    handoff.setdefault("message", None)
+    handoff.setdefault("finalized_at", None)
+    handoff.setdefault("required_region_set", list(SECTION6_REQUIRED_REGION_KEYS))
+    existing_map["section7_handoff"] = handoff
+
+    defaults_lookup = {region_id: (label, side, parent_group) for region_id, label, side, parent_group in SECTION6_REGION_DEFAULTS}
+    regions = existing_map.get("regions", {})
+    for region_id in SECTION6_REQUIRED_REGION_KEYS:
+        defaults = defaults_lookup[region_id]
+        regions[region_id] = _normalize_body_region_entry(
+            region_id,
+            regions.get(region_id, {}),
+            defaults,
+            operation_tag=source,
+        )
+    existing_map["regions"] = regions
+
+    record["body_region_map"] = existing_map
     save_character_record(character_id, record)
-    return body_region_map
+    return existing_map
 
 
 def initialize_body_region_map(
@@ -3098,7 +3148,6 @@ def initialize_body_region_map(
     pose_reference: str | None = None,
     image_reference: str | None = None,
 ) -> dict:
-    """Initialize (or reset) the Section 6 `body_region_map` schema for a character."""
     record = load_character_record(character_id)
     existing_map = record.get("body_region_map")
 
@@ -3120,8 +3169,13 @@ def initialize_body_region_map(
     )
 
 
-def register_body_region_mask_paths(character_id: str, region_masks: dict[str, str], *, validate_existing: bool = True) -> dict:
-    """Register or update per-region mask paths and metadata in the Section 6 map."""
+def register_body_region_mask_paths(
+    character_id: str,
+    region_masks: dict[str, str],
+    *,
+    validate_existing: bool = True,
+    source_operation_tag: str = "section6.register_mask_paths",
+) -> dict:
     record = load_character_record(character_id)
     body_region_map = ensure_body_region_map(character_id)
     regions = body_region_map.get("regions", {})
@@ -3139,20 +3193,24 @@ def register_body_region_mask_paths(character_id: str, region_masks: dict[str, s
 
         region_payload = regions.get(region_id, {})
         if not isinstance(region_payload, dict):
-            region_payload = _default_body_region_entry(
-                region_id,
-                region_id.replace("_", " ").title(),
-                "none",
-                "custom",
-            )
+            defaults = next((label, side, parent_group) for key, label, side, parent_group in SECTION6_REGION_DEFAULTS if key == region_id)
+            region_payload = _default_body_region_entry(region_id, *defaults, operation_tag=source_operation_tag)
 
         region_payload["region_id"] = region_id
         region_payload["mask_path"] = str(resolved_mask_path)
         region_payload["mask_metadata"] = _read_mask_metadata(resolved_mask_path)
+        region_payload["last_edited_at"] = _utc_now_iso()
+        region_payload["source_operation_tag"] = source_operation_tag
         regions[region_id] = region_payload
 
     body_region_map["regions"] = regions
     body_region_map["updated_at"] = _utc_now_iso()
+    body_region_map["section7_handoff"] = {
+        "ready": False,
+        "message": None,
+        "finalized_at": None,
+        "required_region_set": list(SECTION6_REQUIRED_REGION_KEYS),
+    }
     record["body_region_map"] = body_region_map
     save_character_record(character_id, record)
     return body_region_map
@@ -3183,102 +3241,50 @@ def _validate_body_region_map_payload(body_region_map: dict) -> dict:
             "details": details,
         }
 
-    required_set = set(SECTION6_REQUIRED_REGION_KEYS)
-    present_keys = set(regions.keys())
-    missing_required_keys = sorted(required_set - present_keys)
+    missing_required_keys = sorted(set(SECTION6_REQUIRED_REGION_KEYS) - set(regions.keys()))
     if missing_required_keys:
         errors.append(f"Missing required region keys: {missing_required_keys}")
 
-    normalized_key_map: dict[str, list[str]] = {}
-    conflicting_region_ids = []
-    for region_key, region_payload in regions.items():
-        normalized = str(region_key).strip().lower()
-        normalized_key_map.setdefault(normalized, []).append(region_key)
-
-        if not isinstance(region_payload, dict):
-            errors.append(f"Region '{region_key}' payload must be a dictionary.")
-            continue
-
-        payload_region_id = region_payload.get("region_id")
-        if payload_region_id is not None and str(payload_region_id) != str(region_key):
-            conflicting_region_ids.append({"region_key": region_key, "payload_region_id": payload_region_id})
-
-    duplicate_normalized_keys = {
-        normalized: keys
-        for normalized, keys in normalized_key_map.items()
-        if len(keys) > 1
-    }
-    if duplicate_normalized_keys:
-        errors.append(f"Duplicate/conflicting region IDs after normalization: {duplicate_normalized_keys}")
-    if conflicting_region_ids:
-        errors.append(f"Conflicting region IDs between key and payload: {conflicting_region_ids}")
-
     missing_required_masks = []
     invalid_mask_paths = []
-    for region_id in SECTION6_REQUIRED_MASK_REGIONS:
-        region_payload = regions.get(region_id)
-        if not isinstance(region_payload, dict):
-            missing_required_masks.append(region_id)
+    missing_provenance_fields = []
+    invalid_freeze_flags = []
+    for region_id in SECTION6_REQUIRED_REGION_KEYS:
+        payload = regions.get(region_id)
+        if not isinstance(payload, dict):
             continue
 
-        mask_path = region_payload.get("mask_path")
+        mask_path = payload.get("mask_path")
         if not isinstance(mask_path, str) or not mask_path.strip():
             missing_required_masks.append(region_id)
         elif not Path(mask_path).expanduser().exists():
             invalid_mask_paths.append({"region_id": region_id, "mask_path": mask_path})
 
+        for provenance_key in ("last_edited_at", "source_operation_tag"):
+            if not isinstance(payload.get(provenance_key), str) or not payload.get(provenance_key):
+                missing_provenance_fields.append({"region_id": region_id, "field": provenance_key})
+
+        for freeze_flag in ("is_locked", "is_frozen"):
+            if not isinstance(payload.get(freeze_flag), bool):
+                invalid_freeze_flags.append({"region_id": region_id, "field": freeze_flag, "value": payload.get(freeze_flag)})
+
     if missing_required_masks:
         errors.append(f"Missing mask_path for required regions: {sorted(missing_required_masks)}")
     if invalid_mask_paths:
-        warnings.append(f"Mask files not found on disk: {invalid_mask_paths}")
-
-    bilateral_regions_missing_side_hint = []
-    for region_id, _, side, _ in SECTION6_REGION_DEFAULTS:
-        if side != "bilateral":
-            continue
-        payload = regions.get(region_id)
-        if not isinstance(payload, dict):
-            continue
-        region_notes = str(payload.get("notes") or "").lower()
-        region_label = str(payload.get("label") or "").lower()
-        if ("left" in region_notes) ^ ("right" in region_notes):
-            bilateral_regions_missing_side_hint.append(region_id)
-        if "left" in region_label or "right" in region_label:
-            warnings.append(f"Region '{region_id}' label may be too side-specific for bilateral region: {payload.get('label')}")
-
-    if bilateral_regions_missing_side_hint:
-        warnings.append(
-            "Bilateral region notes mention only one side; consider documenting both left/right intent: "
-            f"{sorted(bilateral_regions_missing_side_hint)}"
-        )
-
-    missing_freeze_defaults = []
-    invalid_freeze_values = []
-    for region_id in SECTION6_REQUIRED_REGION_KEYS:
-        payload = regions.get(region_id)
-        if not isinstance(payload, dict):
-            continue
-        if "is_locked" not in payload:
-            missing_freeze_defaults.append(region_id)
-        elif not isinstance(payload.get("is_locked"), bool):
-            invalid_freeze_values.append({"region_id": region_id, "is_locked": payload.get("is_locked")})
-
-    if missing_freeze_defaults:
-        errors.append(f"Missing freeze-state default is_locked for regions: {sorted(missing_freeze_defaults)}")
-    if invalid_freeze_values:
-        errors.append(f"Non-boolean is_locked values found: {invalid_freeze_values}")
+        errors.append(f"Mask files not found on disk: {invalid_mask_paths}")
+    if missing_provenance_fields:
+        errors.append(f"Missing Section 7 provenance fields: {missing_provenance_fields}")
+    if invalid_freeze_flags:
+        errors.append(f"Invalid freeze/lock flags: {invalid_freeze_flags}")
 
     details.update({
         "schema_version": body_region_map.get("schema_version"),
         "region_count": len(regions),
-        "present_region_keys": sorted(regions.keys()),
         "missing_required_region_keys": missing_required_keys,
         "missing_required_masks": sorted(missing_required_masks),
-        "duplicate_normalized_keys": duplicate_normalized_keys,
-        "conflicting_region_ids": conflicting_region_ids,
         "invalid_mask_paths": invalid_mask_paths,
-        "missing_freeze_defaults": sorted(missing_freeze_defaults),
-        "invalid_freeze_values": invalid_freeze_values,
+        "missing_provenance_fields": missing_provenance_fields,
+        "invalid_freeze_flags": invalid_freeze_flags,
     })
 
     return {
@@ -3298,54 +3304,105 @@ def validate_body_region_map(character_id: str) -> dict:
 
 
 def validate_section6_readiness(character_id: str, *, required_region_set: list[str]) -> dict:
-    """Validate Section 6 readiness for Section 7 using a required region gate."""
     validation_result = validate_body_region_map(character_id)
-    errors = list(validation_result.get("errors", []))
     details = validation_result.setdefault("details", {})
+    details["required_region_set"] = list(required_region_set)
 
     record = load_character_record(character_id)
     body_region_map = record.get("body_region_map") or {}
     regions = body_region_map.get("regions") or {}
 
     missing_required_regions = [region_id for region_id in required_region_set if region_id not in regions]
-    missing_required_masks = []
+    details["missing_required_regions_for_section7"] = sorted(missing_required_regions)
+    if missing_required_regions:
+        validation_result.setdefault("errors", []).append(
+            f"Required Section 6 regions are missing: {sorted(missing_required_regions)}"
+        )
+
+    validation_result["pass"] = len(validation_result.get("errors", [])) == 0
+    validation_result["handoff_message"] = SECTION6_READY_MESSAGE if validation_result["pass"] else None
+    return validation_result
+
+
+def finalize_section6_handoff(
+    character_id: str,
+    *,
+    required_region_set: list[str] | None = None,
+    source_operation_tag: str = "section6.finalize_handoff",
+) -> dict:
+    required_region_set = list(required_region_set or SECTION6_REQUIRED_REGION_KEYS)
+    validation_result = validate_section6_readiness(character_id, required_region_set=required_region_set)
+    if not validation_result["pass"]:
+        raise RuntimeError("Section 6 readiness check failed. Resolve errors before continuing to Section 7.")
+
+    record = load_character_record(character_id)
+    body_region_map = ensure_body_region_map(character_id)
+    regions = body_region_map.get("regions", {})
     for region_id in required_region_set:
+        payload = regions.get(region_id)
+        if isinstance(payload, dict):
+            payload.setdefault("last_edited_at", _utc_now_iso())
+            payload.setdefault("source_operation_tag", source_operation_tag)
+
+    body_region_map["regions"] = regions
+    body_region_map["updated_at"] = _utc_now_iso()
+    body_region_map["section7_handoff"] = {
+        "ready": True,
+        "message": SECTION6_READY_MESSAGE,
+        "finalized_at": _utc_now_iso(),
+        "required_region_set": required_region_set,
+    }
+    record["body_region_map"] = body_region_map
+    save_character_record(character_id, record)
+    return {
+        "pass": True,
+        "message": SECTION6_READY_MESSAGE,
+        "character_id": character_id,
+        "required_region_set": required_region_set,
+    }
+
+
+def get_next_editable_region(character_id: str, preferred_order: list[str] | None = None) -> dict | None:
+    body_region_map = ensure_body_region_map(character_id)
+    regions = body_region_map.get("regions", {})
+    region_order = list(preferred_order or SECTION6_REQUIRED_REGION_KEYS)
+
+    for index, region_id in enumerate(region_order):
         payload = regions.get(region_id)
         if not isinstance(payload, dict):
             continue
-        mask_path = payload.get("mask_path")
-        if not isinstance(mask_path, str) or not mask_path.strip() or not Path(mask_path).expanduser().exists():
-            missing_required_masks.append(region_id)
-
-    if missing_required_regions:
-        errors.append(f"Required Section 6 regions are missing: {sorted(missing_required_regions)}")
-    if missing_required_masks:
-        errors.append(f"Required Section 6 regions are missing valid masks: {sorted(missing_required_masks)}")
-
-    validation_result["errors"] = errors
-    validation_result["pass"] = len(errors) == 0
-    details["required_region_set"] = list(required_region_set)
-    details["missing_required_regions_for_section7"] = sorted(missing_required_regions)
-    details["missing_required_masks_for_section7"] = sorted(missing_required_masks)
-    return validation_result
+        if bool(payload.get("is_locked")) or bool(payload.get("is_frozen")):
+            continue
+        return {
+            "region_id": region_id,
+            "order_index": index,
+            "region": payload,
+        }
+    return None
 
 
 def print_section6_region_completion_table(character_id: str) -> None:
     record = load_character_record(character_id)
     regions = (record.get("body_region_map") or {}).get("regions") or {}
 
-    print("region | mask exists | frozen")
-    print("--- | --- | ---")
+    print("region | mask exists | locked | frozen | last_edited_at | source_operation_tag")
+    print("--- | --- | --- | --- | --- | ---")
     for region_id in SECTION6_REQUIRED_REGION_KEYS:
         payload = regions.get(region_id)
         mask_exists = False
+        locked_flag = False
         frozen_flag = False
+        last_edited_at = None
+        source_operation_tag = None
         if isinstance(payload, dict):
             mask_path = payload.get("mask_path")
             if isinstance(mask_path, str) and mask_path.strip():
                 mask_exists = Path(mask_path).expanduser().exists()
-            frozen_flag = bool(payload.get("is_locked"))
-        print(f"{region_id} | {mask_exists} | {frozen_flag}")
+            locked_flag = bool(payload.get("is_locked"))
+            frozen_flag = bool(payload.get("is_frozen"))
+            last_edited_at = payload.get("last_edited_at")
+            source_operation_tag = payload.get("source_operation_tag")
+        print(f"{region_id} | {mask_exists} | {locked_flag} | {frozen_flag} | {last_edited_at} | {source_operation_tag}")
 
 
 # Section 6 workflow cell 1 — Input/config (minimal invocation example)
@@ -3407,7 +3464,11 @@ if not section6_validation_result["pass"]:
         "Section 6 readiness check failed. Resolve errors before continuing to Section 7."
     )
 
-print("Section 6 readiness passed. Safe to continue to Section 7.")
+section6_handoff_result = finalize_section6_handoff(
+    section6_character_id,
+    required_region_set=section6_required_region_set,
+)
+print(section6_handoff_result["message"])
 
 # Section 6 workflow cell 5 — Compact completion summary table
 print_section6_region_completion_table(section6_character_id)

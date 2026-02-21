@@ -4018,6 +4018,222 @@ section7_status = get_section7_refinement_status(
 print("Section 7 status:")
 print(json.dumps(section7_status, indent=2))
 
+
+# SECTION 8 — Canonical Body Finalization (Distinctive Anchor: S8_CANONICAL_FINALIZATION_V1)
+SECTION8_CANONICAL_SCHEMA_VERSION = "section8.canonical_finalization.v1"
+SECTION8_REQUIRED_STAGE = "section7"
+
+
+def _ensure_section8_finalization_state(record: dict, character_id: str) -> dict:
+    section8_state = record.get("section8_canonical_finalization")
+    if not isinstance(section8_state, dict):
+        section8_state = {}
+
+    section8_state.setdefault("schema_version", SECTION8_CANONICAL_SCHEMA_VERSION)
+    section8_state.setdefault("character_id", character_id)
+    section8_state.setdefault("finalizations", [])
+    section8_state.setdefault("created_at", _utc_now_iso())
+    section8_state["updated_at"] = _utc_now_iso()
+    record["section8_canonical_finalization"] = section8_state
+    return section8_state
+
+
+def _snapshot_identity_lock(record: dict) -> dict:
+    identity_lock = record.get("identity_lock")
+    if not isinstance(identity_lock, dict):
+        return {"available": False}
+    refs = identity_lock.get("references")
+    if not isinstance(refs, list):
+        refs = []
+    invariant_features = identity_lock.get("invariant_features")
+    if not isinstance(invariant_features, list):
+        invariant_features = []
+    last_validation = identity_lock.get("last_validation")
+    return {
+        "available": True,
+        "reference_count": len(refs),
+        "invariant_feature_count": len(invariant_features),
+        "fingerprint_backend": (identity_lock.get("fingerprint") or {}).get("backend"),
+        "last_validation": last_validation,
+    }
+
+
+def run_cross_pose_consistency_checks(character_id: str, image_paths: list[str]) -> dict:
+    checks = []
+    failures = []
+
+    for image_path in image_paths:
+        validation = validate_identity_lock(character_id, image_path)
+        passed = bool(validation.get("pass"))
+        checks.append({
+            "image_path": str(Path(image_path).expanduser()),
+            "identity_validation": validation,
+            "pass": passed,
+        })
+        if not passed:
+            failures.append(f"Identity drift check failed for: {image_path}")
+
+    return {
+        "pose_count": len(checks),
+        "checks": checks,
+        "pass": not failures,
+        "failures": failures,
+    }
+
+
+def finalize_canonical_character(
+    character_id: str,
+    canonical_image_path: str,
+    *,
+    version_tag: str,
+    cross_pose_image_paths: list[str] | None = None,
+    notes: str | None = None,
+    require_section7_complete: bool = True,
+    source_operation_tag: str = "section8.finalize_canonical",
+) -> dict:
+    if not isinstance(version_tag, str) or not version_tag.strip():
+        raise ValueError("version_tag must be a non-empty string.")
+
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+
+    section7_status = get_section7_refinement_status(character_id)
+    if require_section7_complete and not bool(section7_status.get("workflow_complete")):
+        raise RuntimeError("Section 7 workflow is not complete. Freeze all required regions before Section 8.")
+
+    canonical_source = Path(canonical_image_path).expanduser()
+    if not canonical_source.exists():
+        raise FileNotFoundError(f"Canonical image does not exist: {canonical_source}")
+
+    cross_pose_candidates = [str(canonical_source)]
+    for pose_path in list(cross_pose_image_paths or []):
+        resolved = Path(pose_path).expanduser()
+        if not resolved.exists():
+            raise FileNotFoundError(f"Cross-pose validation image does not exist: {resolved}")
+        cross_pose_candidates.append(str(resolved))
+
+    cross_pose_report = run_cross_pose_consistency_checks(character_id, cross_pose_candidates)
+    if not cross_pose_report["pass"]:
+        raise RuntimeError(f"Cross-pose consistency checks failed: {cross_pose_report['failures']}")
+
+    canonical_name = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{version_tag.strip()}_canonical{canonical_source.suffix.lower() or '.png'}"
+    canonical_rel, canonical_sha = _copy_to_character_subdir(
+        character_dir,
+        canonical_source,
+        "canonical/finalized",
+        canonical_name,
+    )
+
+    body_region_map = ensure_body_region_map(character_id)
+    regions = body_region_map.get("regions", {})
+    for region_id, payload in regions.items():
+        if not isinstance(payload, dict):
+            continue
+        payload["is_locked"] = True
+        payload["is_frozen"] = True
+        payload["last_edited_at"] = _utc_now_iso()
+        payload["source_operation_tag"] = source_operation_tag
+        regions[region_id] = payload
+    body_region_map["regions"] = regions
+    body_region_map["updated_at"] = _utc_now_iso()
+    record["body_region_map"] = body_region_map
+
+    section8_state = _ensure_section8_finalization_state(record, character_id)
+    finalizations = section8_state.get("finalizations")
+    if not isinstance(finalizations, list):
+        finalizations = []
+
+    finalization_entry = {
+        "timestamp": _utc_now_iso(),
+        "version_tag": version_tag.strip(),
+        "canonical_image": {
+            "path": canonical_rel,
+            "sha256": canonical_sha,
+        },
+        "cross_pose_consistency": cross_pose_report,
+        "identity_snapshot": _snapshot_identity_lock(record),
+        "section7_status": section7_status,
+        "source_operation_tag": source_operation_tag,
+        "notes": (notes or "").strip() or None,
+    }
+
+    finalizations.append(finalization_entry)
+    section8_state["finalizations"] = finalizations
+    section8_state["latest_version_tag"] = version_tag.strip()
+    section8_state["latest_canonical_image"] = canonical_rel
+    section8_state["anatomy_state"] = "canonical_frozen"
+    section8_state["updated_at"] = _utc_now_iso()
+    record["section8_canonical_finalization"] = section8_state
+
+    lifecycle = record.get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        lifecycle = {}
+    lifecycle["anatomy_state"] = "canonical_frozen"
+    lifecycle["canonical_version_tag"] = version_tag.strip()
+    lifecycle["updated_at"] = _utc_now_iso()
+    record["lifecycle"] = lifecycle
+
+    save_character_record(character_id, record)
+    return finalization_entry
+
+
+def get_section8_finalization_status(character_id: str) -> dict:
+    record = load_character_record(character_id)
+    section8_state = _ensure_section8_finalization_state(record, character_id)
+    finalizations = section8_state.get("finalizations")
+    if not isinstance(finalizations, list):
+        finalizations = []
+
+    latest = finalizations[-1] if finalizations else None
+    status = {
+        "character_id": character_id,
+        "schema_version": section8_state.get("schema_version"),
+        "is_finalized": bool(finalizations),
+        "finalization_count": len(finalizations),
+        "latest_version_tag": section8_state.get("latest_version_tag"),
+        "latest_canonical_image": section8_state.get("latest_canonical_image"),
+        "latest_timestamp": latest.get("timestamp") if isinstance(latest, dict) else None,
+        "anatomy_state": (record.get("lifecycle") or {}).get("anatomy_state", "pre_finalization"),
+    }
+    save_character_record(character_id, record)
+    return status
+
+
+# Section 8 workflow cell 1 — Input/config (minimal invocation example)
+section8_character_id = section7_character_id
+section8_canonical_image_path = ""  # e.g., "/content/candidate_final.png"
+section8_version_tag = "v1"
+section8_cross_pose_image_paths = []  # e.g., ["/content/pose_sit.png", "/content/pose_walk.png"]
+section8_notes = ""
+
+print("Section 8 config:")
+print(json.dumps({
+    "character_id": section8_character_id,
+    "canonical_image_path": section8_canonical_image_path,
+    "version_tag": section8_version_tag,
+    "cross_pose_image_paths": section8_cross_pose_image_paths,
+    "notes": section8_notes,
+}, indent=2))
+
+# Section 8 workflow cell 2 — Finalize canonical body (guarded invocation)
+if section8_canonical_image_path:
+    section8_finalization = finalize_canonical_character(
+        section8_character_id,
+        section8_canonical_image_path,
+        version_tag=section8_version_tag,
+        cross_pose_image_paths=section8_cross_pose_image_paths,
+        notes=section8_notes,
+    )
+    print("Section 8 finalization entry:")
+    print(json.dumps(section8_finalization, indent=2))
+else:
+    print("Set section8_canonical_image_path to run canonical finalization.")
+
+# Section 8 workflow cell 3 — Status preview
+section8_status = get_section8_finalization_status(section8_character_id)
+print("Section 8 status:")
+print(json.dumps(section8_status, indent=2))
+
 """
 ---
 

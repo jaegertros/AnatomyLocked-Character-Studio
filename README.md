@@ -101,6 +101,21 @@ This is not a random image generator. Once a character is finalized, identity mu
 7. Mirror notebook logic into `anatomylocked_character_studio.py`.
 8. Run dry QA on 3-5 characters with varied pose/lighting.
 
+## Section 8 Canonical Finalization (Notebook/Script)
+
+- Section 8 is now implemented in notebook/script as a canonical-freeze stage.
+- Core APIs:
+  - `run_cross_pose_consistency_checks(character_id, image_paths)`
+  - `finalize_canonical_character(character_id, canonical_image_path, version_tag=..., cross_pose_image_paths=...)`
+  - `get_section8_finalization_status(character_id)`
+- Finalization behavior:
+  - requires Section 7 completion by default
+  - validates canonical + cross-pose images against Section 5 identity lock
+  - copies canonical image into `canonical/finalized/`
+  - hard-freezes all Section 6 regions (`is_locked = True`, `is_frozen = True`)
+  - stores append-only finalization history in `section8_canonical_finalization`
+  - updates lifecycle `anatomy_state` to `canonical_frozen`
+
 ## Checklist
 
 See Character_Set_Validation_Checklist.md for a validation template.

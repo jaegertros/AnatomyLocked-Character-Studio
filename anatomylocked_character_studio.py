@@ -4252,6 +4252,12 @@ SECTION9_GATE_PASS = "PASS"
 SECTION9_GATE_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
 SECTION9_GATE_FAIL = "FAIL"
 
+SECTION10_ALLOWED_VIEWS = {"front", "back", "left", "right", "3q"}
+SECTION10_ALLOWED_FRAMING = {"full_body", "three_quarter", "waist_up", "close_up"}
+SECTION10_GATE_PASS = "PASS"
+SECTION10_GATE_PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
+SECTION10_GATE_FAIL = "FAIL"
+
 
 SECTION10_SCHEMA_VERSION = "section10.lighting_camera_reference.v1"
 SECTION10_REQUIRED_STAGE = "section8"
@@ -4318,6 +4324,119 @@ def _resolve_section9_canonical_source(record: dict, character_dir: Path, source
         if isinstance(latest_rel, str) and latest_rel.strip():
             return latest_rel, (character_dir / latest_rel)
     return None, None
+
+
+def _resolve_section10_canonical_source(record: dict, character_dir: Path, source_canonical_image: str | None = None) -> tuple[str | None, Path | None]:
+    return _resolve_section9_canonical_source(record, character_dir, source_canonical_image)
+
+
+def validate_section10_reference_request(
+    character_id: str,
+    *,
+    view_spec: dict,
+    lighting_spec: dict,
+    camera_spec: dict,
+    source_canonical_image: str | None = None,
+) -> dict:
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+
+    missing_asset_reasons = []
+    policy_violation_reasons = []
+    warnings = []
+
+    canonical_rel, canonical_path = _resolve_section10_canonical_source(record, character_dir, source_canonical_image)
+    canonical_exists = bool(canonical_path and canonical_path.exists())
+    if not canonical_exists:
+        missing_asset_reasons.append("Canonical source image is required and must exist.")
+
+    normalized_view = str((view_spec or {}).get("view") or "").strip().lower()
+    if normalized_view not in SECTION10_ALLOWED_VIEWS:
+        policy_violation_reasons.append(
+            f"view_spec.view must be one of {sorted(SECTION10_ALLOWED_VIEWS)}."
+        )
+
+    pose_reference = (view_spec or {}).get("pose_reference")
+    normalized_pose_reference = None
+    pose_reference_exists = None
+    if isinstance(pose_reference, str) and pose_reference.strip():
+        normalized_pose_reference = pose_reference.strip()
+        pose_reference_path = Path(normalized_pose_reference).expanduser()
+        if not pose_reference_path.is_absolute():
+            pose_reference_path = character_dir / pose_reference_path
+        pose_reference_exists = pose_reference_path.exists()
+        if not pose_reference_exists:
+            missing_asset_reasons.append(f"Optional pose reference does not exist: {normalized_pose_reference}")
+            warnings.append("Proceeding without pose_reference may reduce pose fidelity.")
+
+    normalized_lighting_mode = str((lighting_spec or {}).get("mode") or "").strip().lower()
+    if normalized_lighting_mode != "neutral_studio":
+        policy_violation_reasons.append("lighting_spec.mode must be 'neutral_studio' for Section 10 baselines.")
+
+    dramatic_variants = (lighting_spec or {}).get("dramatic_variants")
+    normalized_dramatic_variants = []
+    if isinstance(dramatic_variants, list):
+        normalized_dramatic_variants = sorted(
+            str(item).strip().lower() for item in dramatic_variants if str(item).strip()
+        )
+        if normalized_dramatic_variants:
+            warnings.append("dramatic_variants are optional and should only be used after neutral studio outputs.")
+
+    focal_length_value = (camera_spec or {}).get("focal_length_mm")
+    normalized_focal_length = None
+    if isinstance(focal_length_value, (int, float)):
+        normalized_focal_length = float(focal_length_value)
+    else:
+        try:
+            normalized_focal_length = float(str(focal_length_value).strip())
+        except (TypeError, ValueError):
+            normalized_focal_length = None
+
+    if normalized_focal_length is None or normalized_focal_length <= 0:
+        policy_violation_reasons.append("camera_spec.focal_length_mm must be a positive number.")
+
+    orthographic_like = bool((camera_spec or {}).get("orthographic_like"))
+    framing = str((camera_spec or {}).get("framing") or "").strip().lower()
+    if framing not in SECTION10_ALLOWED_FRAMING:
+        policy_violation_reasons.append(
+            f"camera_spec.framing must be one of {sorted(SECTION10_ALLOWED_FRAMING)}."
+        )
+
+    if normalized_focal_length and normalized_focal_length < 35 and not orthographic_like:
+        warnings.append("focal_length_mm < 35 can introduce perspective distortion; consider orthographic_like=True.")
+
+    if missing_asset_reasons or policy_violation_reasons:
+        gate_result = SECTION10_GATE_FAIL
+    elif warnings:
+        gate_result = SECTION10_GATE_PASS_WITH_WARNINGS
+    else:
+        gate_result = SECTION10_GATE_PASS
+
+    return {
+        "character_id": character_id,
+        "gate_result": gate_result,
+        "normalized_specs": {
+            "source_canonical_image": canonical_rel,
+            "view_spec": {
+                "view": normalized_view,
+                "pose_reference": normalized_pose_reference,
+                "pose_reference_exists": pose_reference_exists,
+            },
+            "lighting_spec": {
+                "mode": normalized_lighting_mode,
+                "dramatic_variants": normalized_dramatic_variants,
+            },
+            "camera_spec": {
+                "focal_length_mm": normalized_focal_length,
+                "orthographic_like": orthographic_like,
+                "framing": framing,
+            },
+        },
+        "missing_asset_reasons": missing_asset_reasons,
+        "policy_violation_reasons": policy_violation_reasons,
+        "warnings": warnings,
+        "pass": gate_result != SECTION10_GATE_FAIL,
+    }
 
 
 def _collect_section9_identity_artifact_issues(identity_lock: dict, character_dir: Path) -> list[str]:

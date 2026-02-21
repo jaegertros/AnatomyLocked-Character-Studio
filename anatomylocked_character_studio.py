@@ -3812,17 +3812,48 @@ Each region receives a mask or index.
 
 # SECTION 7 — Regional Refinement Mode (Anatomical Sculpting)
 
-**Purpose:**  
-Iteratively refine anatomy one region at a time.
+**Goal:**
+Build a repeatable regional refinement workflow that improves local fidelity (face/hair/torso/etc.) while preserving Section 5 identity lock invariants and Section 6 region map guarantees.
 
-Workflow:
-1. Lock entire body
-2. Unlock one region
-3. Adjust within realistic bounds
-4. Freeze region permanently
-5. Move to next region
+**Inputs:**
+- `character_id` + canonical `character.json`
+- Section 6 region map and masks
+- Candidate image path
+- Optional per-region config overrides
 
-This mirrors real sculpting discipline.
+**Outputs:**
+- Refined image(s)
+- Optional per-region intermediate artifacts
+- Validation report (identity, mask coverage, regional quality gates)
+- Character record updates with provenance/versioning
+
+**Core functions (notebook first, script mirror):**
+- `load_region_map(character_id)`
+- `validate_region_map(region_map, masks_dir)`
+- `run_regional_refinement(character_id, input_image_path, config=None)`
+- `validate_regional_refinement(character_id, refined_image_path, strict=True)`
+- `promote_refined_candidate(character_id, refined_image_path, report)`
+
+**Gate policy:**
+- Gate A (hard fail): identity lock pass required
+- Gate B (hard fail): required regions processed
+- Gate C (configurable hard/soft fail): regional quality checks
+- Gate D (hard fail): provenance completeness
+- Summary status: `PASS`, `PASS_WITH_WARNINGS`, `FAIL`
+
+**Initial region scope:**
+- `face_primary`
+- `hair_silhouette`
+- `upper_torso`
+
+**Implementation sequence:**
+1. Finalize Section 6 schema and validators
+2. Add append-only `regional_refinement` block in `character.json`
+3. Implement map/mask load + validation helpers
+4. Implement deterministic regional refinement/compositing
+5. Apply Section 5 identity backend fallback (`insightface -> clip -> phash/dhash`)
+6. Emit report + promotion metadata
+7. Run QA with 3-5 characters under varied pose/lighting
 
 ---
 

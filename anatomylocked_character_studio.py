@@ -5463,6 +5463,40 @@ def get_section11_export_status(character_id: str) -> dict:
         "latest_reference_count": int(latest_run.get("reference_count") or 0),
     }
 
+
+# SECTION 12 — Character Save & Reload System
+
+SECTION12_SCHEMA_VERSION = "S12_SAVE_RELOAD_V1"
+SECTION12_REQUIRED_STAGE = "section11"
+
+
+def _ensure_section12_state(record: dict, character_id: str) -> dict:
+    state = record.get("section12_save_reload")
+    if not isinstance(state, dict):
+        state = {}
+
+    snapshots = state.get("snapshots")
+    if not isinstance(snapshots, list):
+        snapshots = []
+
+    latest_snapshot_id = state.get("latest_snapshot_id")
+    if latest_snapshot_id is not None and not isinstance(latest_snapshot_id, str):
+        latest_snapshot_id = None
+
+    active_snapshot_id = state.get("active_snapshot_id")
+    if active_snapshot_id is not None and not isinstance(active_snapshot_id, str):
+        active_snapshot_id = None
+
+    state.setdefault("schema_version", SECTION12_SCHEMA_VERSION)
+    state.setdefault("character_id", character_id)
+    state["snapshots"] = snapshots
+    state["latest_snapshot_id"] = latest_snapshot_id
+    state["active_snapshot_id"] = active_snapshot_id
+    state.setdefault("created_at", _utc_now_iso())
+    state["updated_at"] = _utc_now_iso()
+    record["section12_save_reload"] = state
+    return state
+
 """
 ---
 

@@ -5497,6 +5497,161 @@ def _ensure_section12_state(record: dict, character_id: str) -> dict:
     record["section12_save_reload"] = state
     return state
 
+
+def create_section12_character_snapshot(
+    character_id: str,
+    *,
+    snapshot_label: str | None = None,
+    notes: str | None = None,
+    include_exports: bool = True,
+    include_intermediate: bool = False,
+    strict_gate_checks: bool = True,
+) -> dict:
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+    section12_state = _ensure_section12_state(record, character_id)
+
+    identity_lock = record.get("identity_lock")
+    if not isinstance(identity_lock, dict) or identity_lock.get("status") != "locked":
+        raise RuntimeError("Section 12 snapshot requires identity_lock.status == 'locked'.")
+
+    section8_state = record.get("section8_canonical_finalization")
+    finalizations = section8_state.get("finalizations") if isinstance(section8_state, dict) else None
+    section8_finalized = isinstance(finalizations, list) and bool(finalizations)
+    if strict_gate_checks and not section8_finalized:
+        raise RuntimeError("Strict Section 12 snapshot gating requires a finalized Section 8 canonical state.")
+
+    latest_section8 = finalizations[-1] if section8_finalized and isinstance(finalizations[-1], dict) else {}
+    latest_section8_canonical_rel = (
+        (latest_section8.get("canonical_image") or {}).get("path")
+        if isinstance(latest_section8, dict)
+        else None
+    )
+    if not latest_section8_canonical_rel and isinstance(section8_state, dict):
+        latest_section8_canonical_rel = section8_state.get("latest_canonical_image")
+
+    section9_state = record.get("section9_pose_deformation")
+    section10_state = (
+        record.get("section10_lighting_camera_reference")
+        or record.get("section10_reference_views")
+    )
+    section11_state = record.get("section11_reference_export")
+
+    latest_section9_run_id = section9_state.get("latest_run_id") if isinstance(section9_state, dict) else None
+    latest_section10_run_id = section10_state.get("latest_run_id") if isinstance(section10_state, dict) else None
+    latest_section11_run_id = section11_state.get("latest_run_id") if isinstance(section11_state, dict) else None
+
+    checksums: dict[str, Any] = {
+        "character_record": {
+            "file": "character.json",
+            "sha256": _sha256_file(character_dir / "character.json"),
+        },
+        "canonical_image": {
+            "file": latest_section8_canonical_rel,
+            "sha256": None,
+            "exists": False,
+        },
+        "identity_references": [],
+        "export_manifest": None,
+    }
+
+    if isinstance(latest_section8_canonical_rel, str) and latest_section8_canonical_rel.strip():
+        canonical_path = character_dir / latest_section8_canonical_rel
+        checksums["canonical_image"]["exists"] = canonical_path.exists()
+        if canonical_path.exists():
+            checksums["canonical_image"]["sha256"] = _sha256_file(canonical_path)
+
+    identity_refs = identity_lock.get("reference_images")
+    if not isinstance(identity_refs, list):
+        identity_refs = []
+    for index, ref in enumerate(identity_refs):
+        if not isinstance(ref, dict):
+            continue
+        ref_file = ref.get("file")
+        if not isinstance(ref_file, str) or not ref_file.strip():
+            continue
+        ref_path = character_dir / ref_file
+        checksums["identity_references"].append({
+            "index": index,
+            "file": ref_file,
+            "sha256": _sha256_file(ref_path) if ref_path.exists() else None,
+            "exists": ref_path.exists(),
+        })
+
+    if include_exports and isinstance(section11_state, dict):
+        runs = section11_state.get("runs")
+        if not isinstance(runs, list):
+            runs = []
+        latest_export_run = runs[-1] if runs and isinstance(runs[-1], dict) else {}
+        manifest_file = latest_export_run.get("manifest_file")
+        if isinstance(manifest_file, str) and manifest_file.strip():
+            manifest_path = character_dir / manifest_file
+            checksums["export_manifest"] = {
+                "file": manifest_file,
+                "sha256": _sha256_file(manifest_path) if manifest_path.exists() else None,
+                "exists": manifest_path.exists(),
+            }
+
+    snapshot_id = f"s12-{uuid.uuid4().hex[:12]}"
+    snapshot_timestamp = _utc_now_iso()
+    lifecycle_state = record.get("lifecycle") if isinstance(record.get("lifecycle"), dict) else {}
+
+    snapshot_entry = {
+        "snapshot_id": snapshot_id,
+        "timestamp": snapshot_timestamp,
+        "snapshot_label": (snapshot_label or "").strip() or None,
+        "notes": (notes or "").strip() or None,
+        "flags": {
+            "include_exports": bool(include_exports),
+            "include_intermediate": bool(include_intermediate),
+            "strict_gate_checks": bool(strict_gate_checks),
+        },
+        "gates": {
+            "identity_lock_status": identity_lock.get("status"),
+            "section8_finalized": bool(section8_finalized),
+        },
+        "lifecycle_state": {
+            "anatomy_state": lifecycle_state.get("anatomy_state"),
+            "canonical_version_tag": lifecycle_state.get("canonical_version_tag"),
+        },
+        "anatomy_state": (
+            (section8_state.get("anatomy_state") if isinstance(section8_state, dict) else None)
+            or lifecycle_state.get("anatomy_state")
+            or "unknown"
+        ),
+        "source_runs": {
+            "section8_version_tag": (
+                (latest_section8.get("version_tag") if isinstance(latest_section8, dict) else None)
+                or (section8_state.get("latest_version_tag") if isinstance(section8_state, dict) else None)
+            ),
+            "section9_run_id": latest_section9_run_id,
+            "section10_run_id": latest_section10_run_id,
+            "section11_run_id": latest_section11_run_id,
+        },
+        "checksums": checksums,
+    }
+
+    if include_intermediate:
+        snapshot_entry["intermediate"] = {
+            "section9_run_count": len(section9_state.get("runs") or []) if isinstance(section9_state, dict) else 0,
+            "section10_run_count": len(section10_state.get("runs") or []) if isinstance(section10_state, dict) else 0,
+            "section11_run_count": len(section11_state.get("runs") or []) if isinstance(section11_state, dict) else 0,
+        }
+
+    snapshots = section12_state.get("snapshots")
+    if not isinstance(snapshots, list):
+        snapshots = []
+    snapshots.append(snapshot_entry)
+    section12_state["snapshots"] = snapshots
+    section12_state["latest_snapshot_id"] = snapshot_id
+    if section12_state.get("active_snapshot_id") is None:
+        section12_state["active_snapshot_id"] = snapshot_id
+    section12_state["updated_at"] = _utc_now_iso()
+    record["section12_save_reload"] = section12_state
+
+    save_character_record(character_id, record)
+    return snapshot_entry
+
 """
 ---
 

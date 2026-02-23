@@ -5492,10 +5492,36 @@ def _ensure_section12_state(record: dict, character_id: str) -> dict:
     state["snapshots"] = snapshots
     state["latest_snapshot_id"] = latest_snapshot_id
     state["active_snapshot_id"] = active_snapshot_id
+
+    if not isinstance(state.get("refinement_resume_policy"), dict):
+        state["refinement_resume_policy"] = {
+            "explicit_unlock_acknowledged": False,
+            "acknowledged_at": None,
+            "acknowledged_by": None,
+        }
+
     state.setdefault("created_at", _utc_now_iso())
     state["updated_at"] = _utc_now_iso()
     record["section12_save_reload"] = state
     return state
+
+
+def acknowledge_section12_refinement_resume(character_id: str, *, acknowledged_by: str | None = None) -> dict:
+    """Set explicit_unlock_acknowledged=True in section12 refinement_resume_policy.
+
+    This must be called before passing allow_refinement_resume=True to
+    reload_section12_character_snapshot. Returns the updated policy block.
+    """
+    record = load_character_record(character_id)
+    section12_state = _ensure_section12_state(record, character_id)
+    policy = section12_state["refinement_resume_policy"]
+    policy["explicit_unlock_acknowledged"] = True
+    policy["acknowledged_at"] = _utc_now_iso()
+    policy["acknowledged_by"] = acknowledged_by or os.getenv("USER") or os.getenv("USERNAME")
+    section12_state["updated_at"] = _utc_now_iso()
+    record["section12_save_reload"] = section12_state
+    save_character_record(character_id, record)
+    return dict(policy)
 
 
 def create_section12_character_snapshot(
@@ -5651,6 +5677,265 @@ def create_section12_character_snapshot(
 
     save_character_record(character_id, record)
     return snapshot_entry
+
+
+def _resolve_section12_snapshot(state: dict, snapshot_id: str | None) -> dict:
+    snapshots = state.get("snapshots") if isinstance(state.get("snapshots"), list) else []
+    if not snapshots:
+        raise RuntimeError("No Section 12 snapshots are available to reload.")
+
+    if snapshot_id is None:
+        candidate_snapshot_id = state.get("latest_snapshot_id")
+        if isinstance(candidate_snapshot_id, str):
+            for entry in reversed(snapshots):
+                if isinstance(entry, dict) and entry.get("snapshot_id") == candidate_snapshot_id:
+                    return entry
+        for entry in reversed(snapshots):
+            if isinstance(entry, dict) and isinstance(entry.get("snapshot_id"), str):
+                return entry
+        raise RuntimeError("Unable to resolve latest Section 12 snapshot.")
+
+    target_id = str(snapshot_id).strip()
+    if not target_id:
+        raise RuntimeError("snapshot_id must be a non-empty string when provided.")
+    for entry in snapshots:
+        if isinstance(entry, dict) and entry.get("snapshot_id") == target_id:
+            return entry
+    raise KeyError(f"Section 12 snapshot '{target_id}' was not found.")
+
+
+def _evaluate_section12_artifact(character_dir: Path, artifact: dict | None) -> dict:
+    artifact = artifact if isinstance(artifact, dict) else {}
+    rel_path = artifact.get("file") if isinstance(artifact.get("file"), str) else None
+    expected_sha = artifact.get("sha256") if isinstance(artifact.get("sha256"), str) else None
+
+    if not rel_path:
+        return {
+            "file": None,
+            "exists": False,
+            "sha256": None,
+            "expected_sha256": expected_sha,
+            "checksum_match": expected_sha is None,
+            "reason": "missing_file_reference",
+            "error": None,
+        }
+
+    rel_path_obj = Path(rel_path)
+    if rel_path_obj.is_absolute():
+        return {
+            "file": rel_path,
+            "exists": False,
+            "sha256": None,
+            "expected_sha256": expected_sha,
+            "checksum_match": expected_sha is None,
+            "reason": "unsafe_path",
+            "error": None,
+        }
+
+    base_dir = character_dir.resolve()
+    abs_path = (base_dir / rel_path_obj).resolve()
+    try:
+        abs_path.relative_to(base_dir)
+    except ValueError:
+        return {
+            "file": rel_path,
+            "exists": False,
+            "sha256": None,
+            "expected_sha256": expected_sha,
+            "checksum_match": expected_sha is None,
+            "reason": "unsafe_path",
+            "error": None,
+        }
+
+    exists = abs_path.exists()
+    actual_sha: str | None = None
+    checksum_match: bool = expected_sha is None
+    reason: str | None = None
+    error: str | None = None
+
+    if exists:
+        try:
+            actual_sha = _sha256_file(abs_path)
+            checksum_match = (expected_sha is None) or (actual_sha == expected_sha)
+        except Exception as exc:
+            actual_sha = None
+            checksum_match = False
+            reason = "hash_error"
+            error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "file": rel_path,
+        "exists": exists,
+        "sha256": actual_sha,
+        "expected_sha256": expected_sha,
+        "checksum_match": checksum_match,
+        "reason": reason,
+        "error": error,
+    }
+
+
+def reload_section12_character_snapshot(
+    character_id: str,
+    snapshot_id: str | None = None,
+    *,
+    allow_refinement_resume: bool = False,
+) -> dict:
+    record = load_character_record(character_id)
+    character_dir = _character_dir(character_id)
+    section12_state = _ensure_section12_state(record, character_id)
+    snapshot = _resolve_section12_snapshot(section12_state, snapshot_id)
+
+    reasons = []
+    warnings = []
+    resolved_artifacts: dict[str, Any] = {}
+
+    checksums = snapshot.get("checksums") if isinstance(snapshot.get("checksums"), dict) else {}
+    resolved_artifacts["character_record"] = _evaluate_section12_artifact(character_dir, checksums.get("character_record"))
+    resolved_artifacts["canonical_image"] = _evaluate_section12_artifact(character_dir, checksums.get("canonical_image"))
+
+    identity_artifacts = []
+    identity_refs = checksums.get("identity_references") if isinstance(checksums.get("identity_references"), list) else []
+    for identity_ref in identity_refs:
+        evaluation = _evaluate_section12_artifact(character_dir, identity_ref if isinstance(identity_ref, dict) else {})
+        evaluation["index"] = identity_ref.get("index") if isinstance(identity_ref, dict) else None
+        identity_artifacts.append(evaluation)
+    resolved_artifacts["identity_references"] = identity_artifacts
+
+    export_manifest_eval = _evaluate_section12_artifact(character_dir, checksums.get("export_manifest"))
+    resolved_artifacts["export_manifest"] = export_manifest_eval
+
+    for artifact_name, evaluation in resolved_artifacts.items():
+        if artifact_name == "identity_references":
+            continue
+        if evaluation.get("file") and not evaluation.get("exists"):
+            reasons.append(f"{artifact_name} is missing: {evaluation.get('file')}")
+        if evaluation.get("exists") and not evaluation.get("checksum_match"):
+            reasons.append(f"{artifact_name} checksum mismatch: {evaluation.get('file')}")
+
+    for evaluation in identity_artifacts:
+        if evaluation.get("file") and not evaluation.get("exists"):
+            reasons.append(f"identity reference missing: {evaluation.get('file')}")
+        if evaluation.get("exists") and not evaluation.get("checksum_match"):
+            reasons.append(f"identity reference checksum mismatch: {evaluation.get('file')}")
+
+    section8_state = record.get("section8_canonical_finalization") if isinstance(record.get("section8_canonical_finalization"), dict) else {}
+    finalizations = section8_state.get("finalizations") if isinstance(section8_state.get("finalizations"), list) else []
+    anatomy_state = (
+        section8_state.get("anatomy_state")
+        or (record.get("lifecycle") or {}).get("anatomy_state")
+        or snapshot.get("anatomy_state")
+        or "unknown"
+    )
+    if not finalizations:
+        reasons.append("Section 8 canonical finalization is missing.")
+    if anatomy_state != "canonical_frozen":
+        reasons.append(f"Section 8 freeze integrity failed: anatomy_state='{anatomy_state}'.")
+
+    identity_lock = record.get("identity_lock") if isinstance(record.get("identity_lock"), dict) else None
+    if not isinstance(identity_lock, dict):
+        reasons.append("Section 5 identity lock record is missing.")
+    else:
+        if identity_lock.get("status") != "locked":
+            reasons.append("Section 5 identity lock is not in 'locked' status.")
+        artifact_issues = _collect_section9_identity_artifact_issues(identity_lock, character_dir)
+        if artifact_issues:
+            reasons.extend([f"Section 5 identity artifact issue: {issue}" for issue in artifact_issues])
+
+    source_runs = snapshot.get("source_runs") if isinstance(snapshot.get("source_runs"), dict) else {}
+    section10_run_id = source_runs.get("section10_run_id")
+    section11_run_id = source_runs.get("section11_run_id")
+
+    section10_state = record.get("section10_lighting_camera_reference")
+    if not isinstance(section10_state, dict):
+        section10_state = record.get("section10_reference_views") if isinstance(record.get("section10_reference_views"), dict) else {}
+    section10_runs = section10_state.get("runs") if isinstance(section10_state.get("runs"), list) else []
+    if section10_run_id:
+        section10_run = next((run for run in section10_runs if isinstance(run, dict) and run.get("run_id") == section10_run_id), None)
+        if not isinstance(section10_run, dict):
+            reasons.append(f"Referenced Section 10 run is unavailable: {section10_run_id}")
+        else:
+            # Section 10 runs use output.image_path (lighting/camera runs) or
+            # references[*].file (manifest runs) — there is no 'artifacts' list.
+            referenced_paths: list[str] = []
+            output = section10_run.get("output")
+            if isinstance(output, dict):
+                rel = output.get("image_path")
+                if isinstance(rel, str) and rel.strip():
+                    referenced_paths.append(rel)
+            references = section10_run.get("references")
+            if isinstance(references, list):
+                for ref in references:
+                    if not isinstance(ref, dict):
+                        continue
+                    rel = ref.get("file")
+                    if isinstance(rel, str) and rel.strip():
+                        referenced_paths.append(rel)
+            missing = sorted({rel for rel in referenced_paths if not (character_dir / rel).exists()})
+            if missing:
+                reasons.append(f"Section 10 referenced files are missing: {missing}")
+    elif section10_runs:
+        warnings.append("Snapshot does not reference a Section 10 run_id.")
+
+    section11_state = record.get("section11_reference_export") if isinstance(record.get("section11_reference_export"), dict) else {}
+    section11_runs = section11_state.get("runs") if isinstance(section11_state.get("runs"), list) else []
+    if section11_run_id:
+        section11_run = next((run for run in section11_runs if isinstance(run, dict) and run.get("run_id") == section11_run_id), None)
+        if not isinstance(section11_run, dict):
+            reasons.append(f"Referenced Section 11 run is unavailable: {section11_run_id}")
+        else:
+            for field in ("manifest_file", "archive_file"):
+                rel = section11_run.get(field)
+                if isinstance(rel, str) and rel.strip() and not (character_dir / rel).exists():
+                    reasons.append(f"Section 11 {field} is missing: {rel}")
+    elif section11_runs:
+        warnings.append("Snapshot does not reference a Section 11 run_id.")
+
+    if allow_refinement_resume:
+        policy = section12_state.get("refinement_resume_policy") if isinstance(section12_state.get("refinement_resume_policy"), dict) else {}
+        if policy.get("explicit_unlock_acknowledged") is not True:
+            reasons.append(
+                "allow_refinement_resume requested without explicit unlock policy acknowledgement "
+                "(section12_save_reload.refinement_resume_policy.explicit_unlock_acknowledged == true)."
+            )
+        else:
+            warnings.append("Refinement resume requested; Section 6/8 remain frozen until an explicit unlock operation runs.")
+
+    reload_pass = not reasons
+    snapshot_id = snapshot.get("snapshot_id")
+    if reload_pass:
+        section12_state["active_snapshot_id"] = snapshot_id
+    section12_state["last_attempted_snapshot_id"] = snapshot_id
+    reload_events = section12_state.get("reload_events") if isinstance(section12_state.get("reload_events"), list) else []
+    reload_events.append({
+        "timestamp": _utc_now_iso(),
+        "event": "reload_snapshot",
+        "snapshot_id": snapshot_id,
+        "allow_refinement_resume": bool(allow_refinement_resume),
+        "operator": {
+            "user": os.getenv("USER") or os.getenv("USERNAME"),
+            "hostname": os.getenv("HOSTNAME"),
+        },
+        "outcome": "pass" if reload_pass else "fail",
+        "reason_count": len(reasons),
+        "warning_count": len(warnings),
+    })
+    section12_state["reload_events"] = reload_events
+    section12_state["updated_at"] = _utc_now_iso()
+    record["section12_save_reload"] = section12_state
+
+    report = {
+        "character_id": character_id,
+        "snapshot_id": snapshot_id,
+        "reload_pass": reload_pass,
+        "reasons": reasons,
+        "warnings": warnings,
+        "resolved_artifacts": resolved_artifacts,
+        "anatomy_state": anatomy_state,
+        "timestamp": _utc_now_iso(),
+    }
+    section12_state["last_reload_report"] = report
+    save_character_record(character_id, record)
+    return report
 
 """
 ---

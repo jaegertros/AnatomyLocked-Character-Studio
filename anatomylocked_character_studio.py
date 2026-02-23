@@ -5492,10 +5492,36 @@ def _ensure_section12_state(record: dict, character_id: str) -> dict:
     state["snapshots"] = snapshots
     state["latest_snapshot_id"] = latest_snapshot_id
     state["active_snapshot_id"] = active_snapshot_id
+
+    if not isinstance(state.get("refinement_resume_policy"), dict):
+        state["refinement_resume_policy"] = {
+            "explicit_unlock_acknowledged": False,
+            "acknowledged_at": None,
+            "acknowledged_by": None,
+        }
+
     state.setdefault("created_at", _utc_now_iso())
     state["updated_at"] = _utc_now_iso()
     record["section12_save_reload"] = state
     return state
+
+
+def acknowledge_section12_refinement_resume(character_id: str, *, acknowledged_by: str | None = None) -> dict:
+    """Set explicit_unlock_acknowledged=True in section12 refinement_resume_policy.
+
+    This must be called before passing allow_refinement_resume=True to
+    reload_section12_character_snapshot. Returns the updated policy block.
+    """
+    record = load_character_record(character_id)
+    section12_state = _ensure_section12_state(record, character_id)
+    policy = section12_state["refinement_resume_policy"]
+    policy["explicit_unlock_acknowledged"] = True
+    policy["acknowledged_at"] = _utc_now_iso()
+    policy["acknowledged_by"] = acknowledged_by or os.getenv("USER") or os.getenv("USERNAME")
+    section12_state["updated_at"] = _utc_now_iso()
+    record["section12_save_reload"] = section12_state
+    save_character_record(character_id, record)
+    return dict(policy)
 
 
 def create_section12_character_snapshot(
@@ -5691,12 +5717,51 @@ def _evaluate_section12_artifact(character_dir: Path, artifact: dict | None) -> 
             "expected_sha256": expected_sha,
             "checksum_match": expected_sha is None,
             "reason": "missing_file_reference",
+            "error": None,
         }
 
-    abs_path = character_dir / rel_path
+    rel_path_obj = Path(rel_path)
+    if rel_path_obj.is_absolute():
+        return {
+            "file": rel_path,
+            "exists": False,
+            "sha256": None,
+            "expected_sha256": expected_sha,
+            "checksum_match": expected_sha is None,
+            "reason": "unsafe_path",
+            "error": None,
+        }
+
+    base_dir = character_dir.resolve()
+    abs_path = (base_dir / rel_path_obj).resolve()
+    try:
+        abs_path.relative_to(base_dir)
+    except ValueError:
+        return {
+            "file": rel_path,
+            "exists": False,
+            "sha256": None,
+            "expected_sha256": expected_sha,
+            "checksum_match": expected_sha is None,
+            "reason": "unsafe_path",
+            "error": None,
+        }
+
     exists = abs_path.exists()
-    actual_sha = _sha256_file(abs_path) if exists else None
-    checksum_match = (expected_sha is None) or (actual_sha == expected_sha)
+    actual_sha: str | None = None
+    checksum_match: bool = expected_sha is None
+    reason: str | None = None
+    error: str | None = None
+
+    if exists:
+        try:
+            actual_sha = _sha256_file(abs_path)
+            checksum_match = (expected_sha is None) or (actual_sha == expected_sha)
+        except Exception as exc:
+            actual_sha = None
+            checksum_match = False
+            reason = "hash_error"
+            error = f"{type(exc).__name__}: {exc}"
 
     return {
         "file": rel_path,
@@ -5704,6 +5769,8 @@ def _evaluate_section12_artifact(character_dir: Path, artifact: dict | None) -> 
         "sha256": actual_sha,
         "expected_sha256": expected_sha,
         "checksum_match": checksum_match,
+        "reason": reason,
+        "error": error,
     }
 
 
@@ -5787,10 +5854,25 @@ def reload_section12_character_snapshot(
         if not isinstance(section10_run, dict):
             reasons.append(f"Referenced Section 10 run is unavailable: {section10_run_id}")
         else:
-            artifacts = section10_run.get("artifacts") if isinstance(section10_run.get("artifacts"), list) else []
-            missing = [item.get("resolved_path") for item in artifacts if isinstance(item, dict) and item.get("exists") is False]
+            # Section 10 runs use output.image_path (lighting/camera runs) or
+            # references[*].file (manifest runs) — there is no 'artifacts' list.
+            referenced_paths: list[str] = []
+            output = section10_run.get("output")
+            if isinstance(output, dict):
+                rel = output.get("image_path")
+                if isinstance(rel, str) and rel.strip():
+                    referenced_paths.append(rel)
+            references = section10_run.get("references")
+            if isinstance(references, list):
+                for ref in references:
+                    if not isinstance(ref, dict):
+                        continue
+                    rel = ref.get("file")
+                    if isinstance(rel, str) and rel.strip():
+                        referenced_paths.append(rel)
+            missing = sorted({rel for rel in referenced_paths if not (character_dir / rel).exists()})
             if missing:
-                reasons.append(f"Section 10 referenced artifacts are missing: {missing}")
+                reasons.append(f"Section 10 referenced files are missing: {missing}")
     elif section10_runs:
         warnings.append("Snapshot does not reference a Section 10 run_id.")
 
@@ -5819,12 +5901,15 @@ def reload_section12_character_snapshot(
             warnings.append("Refinement resume requested; Section 6/8 remain frozen until an explicit unlock operation runs.")
 
     reload_pass = not reasons
-    section12_state["active_snapshot_id"] = snapshot.get("snapshot_id")
+    snapshot_id = snapshot.get("snapshot_id")
+    if reload_pass:
+        section12_state["active_snapshot_id"] = snapshot_id
+    section12_state["last_attempted_snapshot_id"] = snapshot_id
     reload_events = section12_state.get("reload_events") if isinstance(section12_state.get("reload_events"), list) else []
     reload_events.append({
         "timestamp": _utc_now_iso(),
         "event": "reload_snapshot",
-        "snapshot_id": snapshot.get("snapshot_id"),
+        "snapshot_id": snapshot_id,
         "allow_refinement_resume": bool(allow_refinement_resume),
         "operator": {
             "user": os.getenv("USER") or os.getenv("USERNAME"),
@@ -5840,7 +5925,7 @@ def reload_section12_character_snapshot(
 
     report = {
         "character_id": character_id,
-        "snapshot_id": snapshot.get("snapshot_id"),
+        "snapshot_id": snapshot_id,
         "reload_pass": reload_pass,
         "reasons": reasons,
         "warnings": warnings,

@@ -1,0 +1,154 @@
+{
+  "version": 1,
+  "1": {
+    "inputs": {
+      "gender": "Neutral",
+      "ethnicity": "Latina",
+      "age_group": "Middle Age",
+      "height": "Average",
+      "body_type": "Athletic",
+      "muscle_definition": "High",
+      "nudity": "Clothed",
+      "clothing_style": "Swimwear",
+      "lighting": "studio lighting, single softbox, rim light"
+    },
+    "class_type": "HumanPrompt",
+    "_meta": {
+      "title": "Human Prompt"
+    }
+  },
+  "2": {
+    "inputs": {
+      "ckpt_name": "majicmixRealistic_v7.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "3": {
+    "inputs": {
+      "model": ["2", 0],
+      "clip": ["2", 1],
+      "lora_name": "RealisticSkinTexture_SkinF1dV2.5.safetensors",
+      "strength_model": 0.2,
+      "strength_clip": 0.2
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "LoRA Loader – Skin"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model": ["3", 0],
+      "clip": ["3", 1],
+      "lora_name": "MuscleEnhancement_v1.safetensors",
+      "strength_model": 0.72,
+      "strength_clip": 0.72
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "LoRA Loader – Muscle"
+    }
+  },
+  "5": {
+    "inputs": {
+      "text": ["1", 0],
+      "clip": ["4", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Encode Positive"
+    }
+  },
+  "6": {
+    "inputs": {
+      "text": ["1", 1],
+      "clip": ["4", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Encode Negative"
+    }
+  },
+  "7": {
+    "inputs": {
+      "control_net_name": "control_v11p_sd15_openpose.pth"
+    },
+    "class_type": "ControlNetLoader",
+    "_meta": {
+      "title": "Load ControlNet"
+    }
+  },
+  "8": {
+    "inputs": {
+      "image": "pose_image.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Pose Image"
+    }
+  },
+  "9": {
+    "inputs": {
+      "strength": 1.0,
+      "conditioning": ["5", 0],
+      "control_net": ["7", 0],
+      "image": ["8", 0]
+    },
+    "class_type": "ControlNetApply",
+    "_meta": {
+      "title": "Apply ControlNet"
+    }
+  },
+  "10": {
+    "inputs": {
+      "width": 1024,
+      "height": 1536,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "Empty Latent"
+    }
+  },
+  "11": {
+    "inputs": {
+      "seed": 345678,
+      "steps": 32,
+      "cfg": 6.5,
+      "sampler_name": "dpmpp_2m_sde",
+      "scheduler": "karras",
+      "denoise": 1.0,
+      "model": ["4", 0],
+      "positive": ["9", 0],
+      "negative": ["6", 0],
+      "latent_image": ["10", 0]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "12": {
+    "inputs": {
+      "samples": ["11", 0],
+      "vae": ["2", 2]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "13": {
+    "inputs": {
+      "filename_prefix": "option3_output",
+      "images": ["12", 0]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}

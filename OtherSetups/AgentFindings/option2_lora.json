@@ -1,0 +1,150 @@
+{
+  "version": 1,
+  "1": {
+    "inputs": {
+      "gender": "Male",
+      "ethnicity": "Asian",
+      "age_group": "Young Adult",
+      "height": "Tall",
+      "body_type": "Muscular",
+      "muscle_definition": "High",
+      "nudity": "Clothed",
+      "clothing_style": "Athletic wear",
+      "lighting": "studio lighting, softbox, rim light"
+    },
+    "class_type": "HumanPrompt",
+    "_meta": {
+      "title": "Human Prompt"
+    }
+  },
+  "2": {
+    "inputs": {
+      "ckpt_name": "AWPortrait_FL.ckpt"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "3": {
+    "inputs": {
+      "model": ["2", 0],
+      "clip": ["2", 1],
+      "lora_name": "RealisticSkinTexture_SkinF1dV2.5.safetensors",
+      "strength_model": 0.2,
+      "strength_clip": 0.2
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "LoRA Loader – Skin Texture"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model": ["3", 0],
+      "clip": ["3", 1],
+      "lora_name": "BodyWeightSlider_XL.safetensors",
+      "strength_model": 0.0,
+      "strength_clip": 0.0
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "LoRA Loader – Body Weight"
+    }
+  },
+  "5": {
+    "inputs": {
+      "model": ["4", 0],
+      "clip": ["4", 1],
+      "lora_name": "AgeSlider.safetensors",
+      "strength_model": 0.0,
+      "strength_clip": 0.0
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "LoRA Loader – Age"
+    }
+  },
+  "6": {
+    "inputs": {
+      "model": ["5", 0],
+      "clip": ["5", 1],
+      "lora_name": "MuscleEnhancement_v1.safetensors",
+      "strength_model": 0.72,
+      "strength_clip": 0.72
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "LoRA Loader – Muscle"
+    }
+  },
+  "7": {
+    "inputs": {
+      "text": ["1", 0],
+      "clip": ["6", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Encode Positive"
+    }
+  },
+  "8": {
+    "inputs": {
+      "text": ["1", 1],
+      "clip": ["6", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Encode Negative"
+    }
+  },
+  "9": {
+    "inputs": {
+      "width": 1024,
+      "height": 1536,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "Empty Latent"
+    }
+  },
+  "10": {
+    "inputs": {
+      "seed": 234567,
+      "steps": 35,
+      "cfg": 7.5,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 1.0,
+      "model": ["6", 0],
+      "positive": ["7", 0],
+      "negative": ["8", 0],
+      "latent_image": ["9", 0]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "11": {
+    "inputs": {
+      "samples": ["10", 0],
+      "vae": ["2", 2]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "12": {
+    "inputs": {
+      "filename_prefix": "option2_output",
+      "images": ["11", 0]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}

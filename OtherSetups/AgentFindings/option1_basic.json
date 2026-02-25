@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "2": {
+    "inputs": {
+      "ckpt_name": "majicmixRealistic_v7.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "1": {
+    "inputs": {
+      "gender": "Female",
+      "ethnicity": "White",
+      "age_group": "Adult",
+      "height": "Average",
+      "body_type": "Average",
+      "muscle_definition": "Moderate",
+      "nudity": "Clothed",
+      "clothing_style": "Casual clothes",
+      "lighting": "studio lighting, rim light, soft shadows, high key"
+    },
+    "class_type": "HumanPrompt",
+    "_meta": {
+      "title": "Human Prompt"
+    }
+  },
+  "3": {
+    "inputs": {
+      "text": ["1", 0],
+      "clip": ["2", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Encode Positive"
+    }
+  },
+  "4": {
+    "inputs": {
+      "text": ["1", 1],
+      "clip": ["2", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Encode Negative"
+    }
+  },
+  "5": {
+    "inputs": {
+      "width": 1024,
+      "height": 1536,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "Empty Latent"
+    }
+  },
+  "6": {
+    "inputs": {
+      "seed": 123456,
+      "steps": 30,
+      "cfg": 7.0,
+      "sampler_name": "dpmpp_2m",
+      "scheduler": "karras",
+      "denoise": 1.0,
+      "model": ["2", 0],
+      "positive": ["3", 0],
+      "negative": ["4", 0],
+      "latent_image": ["5", 0]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "7": {
+    "inputs": {
+      "samples": ["6", 0],
+      "vae": ["2", 2]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "8": {
+    "inputs": {
+      "filename_prefix": "option1_output",
+      "images": ["7", 0]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}
